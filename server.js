@@ -122,8 +122,12 @@ async function sendMessage(phone, text) {
     if (!clientReady) {
         throw new Error(`El cliente WhatsApp no está listo (estado: ${clientState})`);
     }
-    const chatId = `${phone}@c.us`;
-    const info   = await client.sendMessage(chatId, text);
+    // Verificar que el número existe en WhatsApp antes de enviar
+    const numberId = await client.getNumberId(phone);
+    if (!numberId) {
+        throw new Error(`El número ${phone} no está registrado en WhatsApp`);
+    }
+    const info = await client.sendMessage(numberId._serialized, text);
     return { messageId: info.id._serialized };
 }
 

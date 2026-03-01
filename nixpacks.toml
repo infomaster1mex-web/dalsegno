@@ -1,0 +1,35 @@
+[phases.setup]
+nixPkgs = [
+  "chromium",
+  "nss",
+  "freetype",
+  "harfbuzz",
+  "ca-certificates",
+  "ttf-dejavu",
+  "xorg.libX11",
+  "glib",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "mesa",
+  "expat",
+  "libdrm",
+  "xorg.libxcb",
+  "xorg.libXcursor",
+  "xorg.libXi",
+  "cups",
+  "libxkbcommon",
+  "at-spi2-atk",
+  "gtk3",
+  "pango",
+  "cairo",
+  "alsa-lib"
+]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "node server.js"

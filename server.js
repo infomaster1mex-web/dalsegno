@@ -169,38 +169,55 @@ async function interpretarComando(texto) {
         messages: [
             {
                 role: 'system',
-                content: `Eres el asistente de Dalsegno, escuela de música en México.
-Tu trabajo es interpretar comandos en español natural y responder SOLO con JSON válido.
+                content: `Eres el asistente interno de Dalsegno, escuela de música en México.
+Interpretas mensajes en español informal/coloquial y respondes SOLO con JSON válido.
 
 Fecha actual: ${fechaHoy}
 Mes actual (YYYY-MM): ${mesActual}
 
-Acciones disponibles:
-1. register_payment  → registrar que un alumno pagó su mensualidad
-   Campos: student_name (string), amount (número), subject (materia/instrumento), month (YYYY-MM), method ("cash"|"transfer"|"card")
-   
-2. check_payment     → consultar pagos de un alumno
-   Campos: student_name (string)
+## REGLA DE ORO: ASUMIR, NO PREGUNTAR
+Si el mensaje tiene suficiente información para una acción, EJECÚTALA.
+Solo usa "ask" cuando sea IMPOSIBLE deducir la acción. No preguntes lo obvio.
 
-3. list_pending      → listar alumnos sin pago este mes
-   Sin campos adicionales.
+## Acciones:
 
-4. ask               → si falta información necesaria o no entendiste
-   Campos: message (string explicando qué necesitas)
+1. register_payment — registrar pago de mensualidad
+   Campos: student_name, amount, subject (default: "Música"), month (default: ${mesActual}), method (default: "cash")
+   → Usar cuando mencionen pago + nombre + monto. Si falta subject, usa "Música".
 
-Reglas:
-- Si no se menciona el mes, usa el mes actual: ${mesActual}
-- Si no se menciona el método, usa "cash" por defecto
-- Si el monto no está claro, usa action "ask"
-- Infiere el instrumento del contexto (ej: "clase de piano" → subject: "Piano")
-- Nombres propios: capitaliza la primera letra
+2. check_payment — ver historial de pagos de un alumno
+   Campos: student_name
+   → Usar cuando digan solo un nombre, o pregunten por el estado de pagos de alguien.
+   → Si el mensaje ES solo un nombre (ej: "cristian", "Ana"), SIEMPRE usa check_payment.
 
-Ejemplos:
-"Santiago ya pagó 500 de guitarra" → {"action":"register_payment","student_name":"Santiago","amount":500,"subject":"Guitarra","month":"${mesActual}","method":"cash"}
-"registra pago de María 600 piano transferencia" → {"action":"register_payment","student_name":"María","amount":600,"subject":"Piano","month":"${mesActual}","method":"transfer"}
-"¿ha pagado Roberto?" → {"action":"check_payment","student_name":"Roberto"}
+3. list_pending — alumnos sin pago este mes
+   Sin campos.
+   → pendientes, quién debe, sin pagar, morosos
+
+4. list_upcoming — próximos vencimientos de pago
+   Campos opcionales: days (default: 60)
+   → fecha, fechas, cuándo vence, próximos pagos, pagos del mes, del siguiente mes
+   → Si dicen "fecha" o "fechas" a secas → list_upcoming
+   → Si mencionan "próximo" + nombre → list_upcoming con days:60
+
+5. ask — solo si es imposible determinar la acción
+   Campos: message (MUY corto, máx 8 palabras)
+   → NUNCA preguntar cosas como "¿qué acción deseas?"
+   → Solo preguntar el dato concreto que falta: nombre, monto
+
+## Ejemplos de interpretación inteligente:
+"cristian" → {"action":"check_payment","student_name":"Cristian"}
+"fecha" → {"action":"list_upcoming","days":60}
+"fechas" → {"action":"list_upcoming","days":60}
+"próximos" → {"action":"list_upcoming","days":30}
+"cuándo paga cristian" → {"action":"list_upcoming","days":60}
+"pagos de ana" → {"action":"check_payment","student_name":"Ana"}
 "quién debe" → {"action":"list_pending"}
-"pagó 400" → {"action":"ask","message":"¿Quién pagó y por qué clase?"}`
+"pendientes" → {"action":"list_pending"}
+"santiago pagó 500" → {"action":"register_payment","student_name":"Santiago","amount":500,"subject":"Música","month":"${mesActual}","method":"cash"}
+"maría 600 piano transferencia" → {"action":"register_payment","student_name":"María","amount":600,"subject":"Piano","month":"${mesActual}","method":"transfer"}
+"pagó 400" → {"action":"ask","message":"¿Quién pagó?"}
+"registra" → {"action":"ask","message":"¿Quién pagó, cuánto y qué clase?"}`
             },
             { role: 'user', content: texto }
         ]
@@ -291,6 +308,17 @@ client.on('message', async (msg) => {
         return;
     }
 
+    if (lower === 'próximos' || lower === 'proximos' || lower === 'vencimientos' || lower === 'próximos pagos' || lower === 'proximos pagos') {
+        try {
+            const result = await llamarDalsegno({ action: 'list_upcoming', days: 30 });
+            await msg.reply(result.message || 'Sin datos');
+        } catch (e) {
+            console.error('[BOT-IA] Error list_upcoming:', e.message);
+            await msg.reply('❌ Error al consultar próximos vencimientos: ' + e.message);
+        }
+        return;
+    }
+
     if (lower === 'ayuda' || lower === 'help') {
         await msg.reply(
 `🎵 *Comandos disponibles:*
@@ -303,10 +331,13 @@ _"Registra pago María 600 piano transferencia"_
 _"¿Ha pagado Roberto?"_
 _"Ver pagos de Ana González"_
 
-📋 *Alumnos sin pagar:*
+📋 *Sin pagar este mes:*
 _"pendientes"_ o _"quién debe"_
 
-📅 Puedes especificar el mes:
+📅 *Próximos vencimientos:*
+_"próximos pagos"_ o _"cuándo vencen los pagos"_
+
+🗓️ Puedes especificar el mes:
 _"Registra pago Juan 400 batería enero"_`
         );
         return;

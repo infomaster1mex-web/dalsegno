@@ -9,7 +9,7 @@
  *   GET  /qr            → imagen del QR para escanear (PNG base64)
  *   GET  /status        → {"ready": true/false, "state": "..."}
  *   GET  /send?phone=521234567890&text=Hola → envía mensaje
- *   POST /send          → body JSON: { "phone": "521234567890", "text": "Hola" }
+ *   POST /send          → body JSON: { "phone": "521496139953", "text": "Hola" }
  *
  *  VARIABLES DE ENTORNO (Railway → Variables):
  *   PORT            (Railway lo pone automáticamente)
@@ -71,6 +71,11 @@ const client = new Client({
             '--no-first-run',
             '--no-zygote',
             '--disable-gpu',
+            '--disable-extensions',
+            '--disable-sync',
+            '--disable-component-update',
+            '--single-process=false',        // ← Importante: multi-proceso
+            '--disable-crash-handler',       // ← Evita locks en crashes
         ],
     },
 });
@@ -503,6 +508,63 @@ app.post('/send', authMiddleware, async (req, res) => {
     }
 });
 
+// ── LIMPIEZA PROFUNDA DE LOCKS (SOLUCIÓN RAILWAY) ────────────────────────────
+function cleanChromiumLocks() {
+    try {
+        // Patrón de archivos/carpetas a eliminar
+        const lockPatterns = [
+            'SingletonLock', 
+            'SingletonCookie', 
+            'SingletonSocket',
+            'Network Persistent State', 
+            '.com.google.Chrome.metadata_shm',
+            'GPUCache', 
+            'Code Cache', 
+            'Service Worker',
+            'Cache',
+            'shader_cache',
+            '.chrome_profile_lock',
+        ];
+        
+        function cleanDir(dir) {
+            if (!fs.existsSync(dir)) return;
+            try {
+                const files = fs.readdirSync(dir);
+                files.forEach(file => {
+                    const full = path.join(dir, file);
+                    try {
+                        const stat = fs.statSync(full);
+                        const shouldDelete = lockPatterns.some(p => file.includes(p));
+                        
+                        if (shouldDelete) {
+                            if (stat.isDirectory()) {
+                                fs.rmSync(full, { recursive: true, force: true });
+                                console.log('[WA-CLEAN] 🧹 Eliminado carpeta:', file);
+                            } else {
+                                fs.unlinkSync(full);
+                                console.log('[WA-CLEAN] 🧹 Eliminado archivo:', file);
+                            }
+                        } else if (stat.isDirectory() && !['node_modules', '.cache'].includes(file)) {
+                            // Recursivamente limpiar subdirectorios
+                            cleanDir(full);
+                        }
+                    } catch (e) {
+                        console.warn('[WA-CLEAN] Error procesando:', file, e.message);
+                    }
+                });
+            } catch (e) {
+                console.warn('[WA-CLEAN] Error leyendo directorio:', dir, e.message);
+            }
+        }
+        
+        console.log('[WA-CLEAN] ▶️  Iniciando limpieza de locks...');
+        cleanDir(SESSION_DIR);
+        console.log('[WA-CLEAN] ✅ Limpieza completada');
+    } catch (e) {
+        console.error('[WA-CLEAN] Error crítico:', e.message);
+    }
+}
+
 // ── Inicio ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`[SERVER] 🚀 Servidor escuchando en puerto ${PORT}`);
@@ -514,25 +576,14 @@ app.listen(PORT, () => {
     if (!DALSEGNO_API_URL) console.log('[SERVER] ⚠️  Sin DALSEGNO_API_URL — conexión con Dalsegno desactivada');
 });
 
-// ── Limpiar lock de Chromium al arrancar (evita crash en redeploys) ───────────
-try {
-    const lockFiles = [
-        path.join(SESSION_DIR, 'SingletonLock'),
-        path.join(SESSION_DIR, 'SingletonCookie'),
-        path.join(SESSION_DIR, 'SingletonSocket'),
-    ];
-    lockFiles.forEach(f => { if (fs.existsSync(f)) { fs.unlinkSync(f); console.log('[WA] 🧹 Lock eliminado:', f); } });
-    // También buscar en subcarpetas del perfil de Chromium
-    const profilePath = path.join(SESSION_DIR, 'Default');
-    if (fs.existsSync(profilePath)) {
-        const deepLock = path.join(profilePath, 'SingletonLock');
-        if (fs.existsSync(deepLock)) { fs.unlinkSync(deepLock); console.log('[WA] 🧹 Deep lock eliminado'); }
-    }
-} catch (e) {
-    console.warn('[WA] No se pudo limpiar lock:', e.message);
-}
+// Ejecutar limpieza ANTES de inicializar el cliente
+console.log('[WA] Preparando ambiente...');
+cleanChromiumLocks();
 
-client.initialize().catch((err) => {
-    console.error('[WA] Error al inicializar cliente:', err.message);
-    process.exit(1);
-});
+// Esperar un poco para que se complete la limpieza
+setTimeout(() => {
+    client.initialize().catch((err) => {
+        console.error('[WA] ❌ Error al inicializar cliente:', err.message);
+        process.exit(1);
+    });
+}, 1000);

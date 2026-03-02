@@ -244,17 +244,30 @@ client.on('message', async (msg) => {
     // ── Comandos de IA (solo para números administradores autorizados) ────
     if (ADMIN_PHONES.length === 0 || !openai || !DALSEGNO_API_URL) return;
 
-    // Obtener número del remitente (quitar @c.us)
-    const numero = msg.from.replace('@c.us', '').replace('@s.whatsapp.net', '');
-
     // Ignorar grupos
     if (msg.from.includes('@g.us')) return;
+
+    // Obtener número real del contacto (maneja tanto @c.us como @lid)
+    let numero = msg.from.replace('@c.us', '').replace('@s.whatsapp.net', '');
+    
+    // Si viene en formato @lid, obtener el número real del contacto
+    if (msg.from.includes('@lid') || !/^\d+$/.test(numero)) {
+        try {
+            const contact = await msg.getContact();
+            numero = contact.number || contact.id.user;
+            console.log(`[MSG] Número real del contacto: "${numero}"`);
+        } catch (e) {
+            console.log(`[MSG] No se pudo obtener contacto: ${e.message}`);
+        }
+    }
 
     // Solo admins autorizados
     if (!ADMIN_PHONES.includes(numero)) {
         console.log(`[MSG] ⛔ Número no autorizado: "${numero}" — Admins: [${ADMIN_PHONES.join(', ')}]`);
         return;
     }
+    
+    console.log(`[MSG] ✅ Admin autorizado: ${numero}`);
 
     // Ignorar mensajes muy cortos (menos de 4 chars)
     if (!body || body.length < 4) return;

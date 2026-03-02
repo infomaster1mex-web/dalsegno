@@ -1,594 +1,391 @@
 /**
- * =====================================================
- *  DALSEGNO — Bot WhatsApp (whatsapp-web.js + Express)
- *  Deploy: Railway / cualquier VPS con Node.js 18+
- * =====================================================
+ * ╔══════════════════════════════════════════════════════════════╗
+ *  DALSEGNO — Bot WhatsApp Completo v2
+ *  - Mensajes de texto + Audio (transcripción Whisper)
+ *  - CRUD completo: alumnos, clases, pagos, materias
+ *  - Consultas libres con IA + SQL dinámico desde bot.php
+ *  - Menú interactivo con opciones
+ * ╚══════════════════════════════════════════════════════════════╝
  *
- *  ENDPOINTS:
- *   GET  /              → estado del bot
- *   GET  /qr            → imagen del QR para escanear (PNG base64)
- *   GET  /status        → {"ready": true/false, "state": "..."}
- *   GET  /send?phone=521234567890&text=Hola → envía mensaje
- *   POST /send          → body JSON: { "phone": "521496139953", "text": "Hola" }
- *
- *  VARIABLES DE ENTORNO (Railway → Variables):
- *   PORT            (Railway lo pone automáticamente)
- *   ADMIN_TOKEN     Token secreto para proteger /send  (opcional pero recomendado)
- *   SESSION_DIR     Carpeta donde guardar la sesión   (por defecto: ./session)
- *
- *  ── NUEVAS VARIABLES PARA IA ──────────────────────────
- *   OPENAI_API_KEY      Tu API key de OpenAI (sk-...)
- *   DALSEGNO_API_URL    URL completa del bot.php en Hostinger
- *                       ej: https://tudominio.com/api/bot.php
- *   BOT_SECRET_TOKEN    Token secreto compartido con api/bot.php en PHP
- *   ADMIN_PHONES        Números autorizados separados por coma
- *                       ej: 529611234567,521234567890
+ * Variables de entorno:
+ *   ADMIN_PHONES      Números autorizados separados por coma (sin +)
+ *   ADMIN_TOKEN       Token para endpoints HTTP de administración
+ *   BOT_SECRET_TOKEN  Token compartido con api/bot.php
+ *   DALSEGNO_API_URL  URL de api/bot.php en Hostinger
+ *   OPENAI_API_KEY    API Key de OpenAI (GPT-4o-mini + Whisper)
+ *   SESSION_DIR       Carpeta de sesión WhatsApp (default: ./session)
+ *   PORT              Puerto HTTP
  */
 
 'use strict';
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode  = require('qrcode');
-const express = require('express');
-const fs      = require('fs');
-const path    = require('path');
-const app     = express();
+const express  = require('express');
+const fs       = require('fs');
+const https    = require('https');
+const http     = require('http');
+const FormData = require('form-data');
 
-// ── NUEVO: SDK de OpenAI ──────────────────────────────────────────────────────
-const OpenAI = require('openai');
+// ── Variables de entorno ──────────────────────────────────────────────────────
+const ADMIN_PHONES     = (process.env.ADMIN_PHONES || '').split(',').map(p => p.trim()).filter(Boolean);
+const ADMIN_TOKEN      = process.env.ADMIN_TOKEN      || '';
+const BOT_SECRET_TOKEN = process.env.BOT_SECRET_TOKEN || '';
+const DALSEGNO_API_URL = process.env.DALSEGNO_API_URL || '';
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY   || '';
+const SESSION_DIR      = process.env.SESSION_DIR      || './session';
+const PORT             = process.env.PORT             || 3000;
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ── OpenAI: chat completion ───────────────────────────────────────────────────
+function openaiChat(messages, maxTokens = 500, temperature = 0) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify({ model: 'gpt-4o-mini', max_tokens: maxTokens, temperature, messages });
+        const req = https.request({
+            hostname: 'api.openai.com', path: '/v1/chat/completions', method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY, 'Content-Length': Buffer.byteLength(body) }
+        }, res => {
+            let data = '';
+            res.on('data', d => data += d);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)?.choices?.[0]?.message?.content?.trim() || ''); }
+                catch(e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        req.write(body); req.end();
+    });
+}
 
-// ── Configuración ─────────────────────────────────────────────────────────────
-const PORT         = process.env.PORT         || 3000;
-const ADMIN_TOKEN  = process.env.ADMIN_TOKEN  || '';
-const SESSION_DIR  = process.env.SESSION_DIR  || './session';
+// ── Whisper: transcribir audio ────────────────────────────────────────────────
+function transcribirAudio(audioBuffer, mimeType) {
+    return new Promise((resolve, reject) => {
+        const tmpFile = `/tmp/wa_audio_${Date.now()}.ogg`;
+        fs.writeFileSync(tmpFile, audioBuffer);
 
-// ── NUEVO: Configuración de IA y Dalsegno ────────────────────────────────────
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY    || '';
-const DALSEGNO_API_URL  = process.env.DALSEGNO_API_URL  || '';
-const BOT_SECRET_TOKEN  = process.env.BOT_SECRET_TOKEN  || '';
-const ADMIN_PHONES      = (process.env.ADMIN_PHONES || '').split(',').map(p => p.trim()).filter(Boolean);
+        const form = new FormData();
+        form.append('file', fs.createReadStream(tmpFile), { filename: 'audio.ogg', contentType: mimeType || 'audio/ogg' });
+        form.append('model', 'whisper-1');
+        form.append('language', 'es');
 
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+        const req = https.request({
+            hostname: 'api.openai.com', path: '/v1/audio/transcriptions', method: 'POST',
+            headers: { ...form.getHeaders(), 'Authorization': 'Bearer ' + OPENAI_API_KEY }
+        }, res => {
+            let data = '';
+            res.on('data', d => data += d);
+            res.on('end', () => {
+                fs.unlink(tmpFile, () => {});
+                try { resolve(JSON.parse(data)?.text || ''); }
+                catch(e) { reject(e); }
+            });
+        });
+        req.on('error', err => { fs.unlink(tmpFile, () => {}); reject(err); });
+        form.pipe(req);
+    });
+}
 
-// ── Estado global ─────────────────────────────────────────────────────────────
-let qrDataUrl   = null;
-let clientReady = false;
-let clientState = 'STARTING';
+// ── Llamar a bot.php en Hostinger ─────────────────────────────────────────────
+function llamarDalsegno(comando) {
+    return new Promise((resolve, reject) => {
+        if (!DALSEGNO_API_URL) return reject(new Error('DALSEGNO_API_URL no configurada'));
+        const body = JSON.stringify(comando);
+        const url  = new URL(DALSEGNO_API_URL);
+        const mod  = url.protocol === 'https:' ? https : http;
+        const req  = mod.request({
+            hostname: url.hostname, path: url.pathname + url.search, method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Bot-Token': BOT_SECRET_TOKEN, 'Content-Length': Buffer.byteLength(body) }
+        }, res => {
+            let data = '';
+            res.on('data', d => data += d);
+            res.on('end', () => {
+                if (res.statusCode !== 200) return reject(new Error(`Dalsegno API error ${res.statusCode}: ${data.slice(0, 200)}`));
+                try { resolve(JSON.parse(data)); }
+                catch(e) { reject(new Error('Respuesta inválida del servidor')); }
+            });
+        });
+        req.on('error', reject);
+        req.write(body); req.end();
+    });
+}
 
-// ── Cliente WhatsApp ──────────────────────────────────────────────────────────
+// ── Esquema de BD ─────────────────────────────────────────────────────────────
+const DB_SCHEMA = `
+users: id, name, email, phone, user_type(student/teacher/admin), status(active/inactive)
+subjects: id, teacher_id→users, name, level, status(active/inactive)
+classes: id, student_id→users, teacher_id→users, student_name, teacher_name, subject, date(DATE), time(TIME), duration(min), price, status(scheduled/completed/cancelled), payment_status(pending/paid), type(online/presencial), notes
+payments: id, class_id→classes, student_id→users, amount, payment_method(cash/transfer/card), status(pending/paid/cancelled), payment_date, concept
+reminders: id, student_id, student_name, phone_e164, amount, due_at(DATETIME), status(pending/sent/failed/cancelled)
+payment_reminders: id, student_id→users, student_name, phone, amount, due_date(DATE), status(active/completed/cancelled)
+`.trim();
+
+// ── Interpretar mensaje con IA ────────────────────────────────────────────────
+async function interpretarMensaje(texto) {
+    const hoy = new Date().toLocaleDateString('es-MX', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    const mes  = new Date().toISOString().slice(0, 7);
+
+    const raw = await openaiChat([
+        { role: 'system', content: `Eres el asistente de gestión de Dalsegno, escuela de música en México.
+El dueño te habla por WhatsApp en español coloquial para administrar su negocio.
+Responde SOLO con JSON válido. Sin markdown, sin backticks.
+
+Hoy: ${hoy} | Mes: ${mes}
+
+ESQUEMA DE BASE DE DATOS:
+${DB_SCHEMA}
+
+ACCIONES DISPONIBLES:
+
+1. query — Cualquier consulta de información
+   { "action": "query", "question": "pregunta específica en español" }
+   → SIEMPRE usar para: ver alumnos, pagos, clases, estadísticas, reportes, historial
+   → Si dicen un nombre solo → query "ver pagos y clases de [nombre]"
+
+2. register_payment — Registrar pago de mensualidad
+   { "action": "register_payment", "student_name": "", "amount": 0, "subject": "Música", "month": "${mes}", "method": "cash" }
+
+3. create_student — Nuevo alumno
+   { "action": "create_student", "name": "", "phone": "", "email": "" }
+   → email puede ser vacío si no lo mencionan
+
+4. create_class — Programar clase
+   { "action": "create_class", "student_name": "", "subject": "", "date": "YYYY-MM-DD", "time": "HH:MM", "duration": 60, "price": 0, "type": "presencial" }
+   → Infiere fecha de frases como "mañana", "el lunes", "el 5"
+
+5. update_student — Actualizar datos de alumno
+   { "action": "update_student", "student_name": "", "field": "phone|email|status|name", "value": "" }
+
+6. update_class — Actualizar clase
+   { "action": "update_class", "class_id": 0, "field": "status|payment_status|date|time|notes", "value": "" }
+
+7. delete_record — Eliminar registro (solo si piden explícitamente borrar/eliminar)
+   { "action": "delete_record", "type": "student|class|payment", "id": 0 }
+
+8. menu — Mostrar opciones disponibles
+   { "action": "menu" }
+   → "menú", "opciones", "ayuda", "qué puedes hacer", "help"
+
+9. none — Fuera de contexto del negocio
+   { "action": "none", "reply": "respuesta corta amigable" }
+
+10. ask — Solo si falta un dato imprescindible que no se puede asumir
+    { "action": "ask", "message": "pregunta concreta y corta" }
+    → PROHIBIDO preguntar cosas genéricas como "¿qué deseas hacer?"
+    → Solo para: crear clase sin fecha, registrar pago sin nombre, etc.
+
+REGLAS IMPORTANTES:
+- Para consultas de información SIEMPRE usa "query", nunca "none"
+- Infiere nombres aunque tengan typos
+- "mañana" = ${new Date(Date.now()+86400000).toISOString().slice(0,10)}
+- "hoy" = ${new Date().toISOString().slice(0,10)}
+- Para pagos sin método → asumir "cash"
+- Para clases sin duración → asumir 60 min
+- Para clases sin precio → asumir 0 (se actualizará después)` },
+        { role: 'user', content: texto }
+    ], 400, 0);
+
+    return JSON.parse(raw);
+}
+
+// ── Menú ──────────────────────────────────────────────────────────────────────
+const MENU_TEXT = `🎵 *Dalsegno Bot — Comandos disponibles*
+
+💰 *PAGOS*
+_"cristian pagó 500 de guitarra"_
+_"quién debe este mes"_
+_"próximos vencimientos"_
+_"historial de pagos de Ana"_
+
+👥 *ALUMNOS*
+_"lista de alumnos"_
+_"nuevo alumno: Juan García, tel 4961234567"_
+_"cambiar teléfono de Ana a 496-000-0000"_
+_"desactivar alumno Roberto"_
+
+📅 *CLASES*
+_"qué clases hay esta semana"_
+_"programar clase piano con Cristian mañana 4pm"_
+_"cancelar clase #45"_
+_"marcar como pagada clase #50"_
+
+📊 *REPORTES*
+_"cuánto cobré este mes"_
+_"resumen de pagos de marzo"_
+_"clases pendientes de pago"_
+
+🎙️ *También puedes mandarme audios con tus instrucciones*`;
+
+// ── WhatsApp Client ───────────────────────────────────────────────────────────
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
     puppeteer: {
         headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-sync',
-            '--disable-component-update',
-            '--single-process=false',        // ← Importante: multi-proceso
-            '--disable-crash-handler',       // ← Evita locks en crashes
-        ],
-    },
-});
-
-client.on('qr', async (qr) => {
-    clientState = 'QR_READY';
-    clientReady = false;
-    qrDataUrl = await qrcode.toDataURL(qr);
-    console.log('[QR] Nuevo QR generado — visita /qr para escanearlo');
-    require('qrcode-terminal').generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    clientReady = true;
-    clientState = 'READY';
-    qrDataUrl   = null;
-    console.log('[WA] ✅ Cliente listo y conectado');
-});
-
-client.on('authenticated', () => {
-    clientState = 'AUTHENTICATED';
-    console.log('[WA] Autenticado correctamente');
-});
-
-client.on('auth_failure', (msg) => {
-    clientState = 'AUTH_FAILURE';
-    clientReady = false;
-    console.error('[WA] ❌ Error de autenticación:', msg);
-});
-
-client.on('disconnected', (reason) => {
-    clientState = 'DISCONNECTED';
-    clientReady = false;
-    console.warn('[WA] Desconectado:', reason);
-    setTimeout(() => {
-        console.log('[WA] Intentando reconectar...');
-        client.initialize().catch(console.error);
-    }, 5000);
-});
-
-// ── Middleware de autenticación ───────────────────────────────────────────────
-function authMiddleware(req, res, next) {
-    if (!ADMIN_TOKEN) return next();
-    const token =
-        req.headers['x-admin-token'] ||
-        req.query.token              ||
-        (req.body && req.body.token);
-    if (token === ADMIN_TOKEN) return next();
-    return res.status(401).json({ ok: false, error: 'Token inválido' });
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function normalizePhone(raw) {
-    const digits = String(raw || '').replace(/\D/g, '');
-    if (/^52\d{10}$/.test(digits)) return digits;
-    if (/^\d{10}$/.test(digits))   return '52' + digits;
-    return digits;
-}
-
-async function sendMessage(phone, text) {
-    if (!clientReady) {
-        throw new Error(`El cliente WhatsApp no está listo (estado: ${clientState})`);
+        args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+               '--disable-gpu','--no-first-run','--no-zygote','--single-process']
     }
-    const numberId = await client.getNumberId(phone);
-    if (!numberId) {
-        throw new Error(`El número ${phone} no está registrado en WhatsApp`);
-    }
-    const info = await client.sendMessage(numberId._serialized, text);
-    return { messageId: info.id._serialized };
-}
+});
 
-// ── NUEVO: Funciones de IA ────────────────────────────────────────────────────
+client.on('qr', qr => {
+    console.log('[WA] 📱 QR listo — visita http://localhost:' + PORT);
+    global.__QR__ = qr;
+});
+client.on('authenticated',  () => console.log('[WA] Autenticado correctamente'));
+client.on('auth_failure',   m  => console.error('[WA] Auth failure:', m));
+client.on('ready',          () => { console.log('[WA] ✅ Cliente listo y conectado'); global.__QR__ = null; });
+client.on('disconnected',   r  => console.log('[WA] Desconectado:', r));
 
-/**
- * Usa GPT para interpretar un comando en lenguaje natural
- * y convertirlo a una acción estructurada JSON.
- */
-async function interpretarComando(texto) {
-    if (!openai) throw new Error('OPENAI_API_KEY no configurada');
-
-    const mesActual = new Date().toISOString().slice(0, 7); // "2026-03"
-    const fechaHoy  = new Date().toLocaleDateString('es-MX', {
-        weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
-    });
-
-    const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',   // barato y muy rápido, perfecto para esto
-        max_tokens: 300,
-        temperature: 0,         // respuestas consistentes
-        response_format: { type: 'json_object' }, // fuerza JSON puro, sin markdown
-        messages: [
-            {
-                role: 'system',
-                content: `Eres el asistente de gestión de Dalsegno, una escuela de música en México.
-Tu dueño te habla por WhatsApp en español coloquial e informal para administrar su negocio.
-
-## CONTEXTO DEL NEGOCIO
-Dalsegno registra alumnos, clases de música (guitarra, piano, batería, etc.) y pagos mensuales.
-Los alumnos pagan mensualidades. El sistema también guarda recordatorios de vencimiento de pagos.
-
-## TU ÚNICA TAREA
-Analizar el mensaje del dueño e inferir qué quiere hacer. Responder SIEMPRE con JSON válido.
-Fecha hoy: ${fechaHoy} | Mes actual: ${mesActual}
-
-## ACCIONES DISPONIBLES
-{ "action": "register_payment", "student_name": "", "amount": 0, "subject": "Música", "month": "${mesActual}", "method": "cash" }
-  → Registrar que un alumno pagó. method puede ser: cash | transfer | card
-
-{ "action": "check_payment", "student_name": "" }
-  → Ver historial de pagos de un alumno específico
-
-{ "action": "list_pending" }
-  → Ver qué alumnos NO han pagado este mes
-
-{ "action": "list_upcoming", "days": 60 }
-  → Ver pagos próximos a vencer según recordatorios programados
-
-{ "action": "list_classes", "days": 7 }
-  → Ver clases programadas. Puede incluir "student_name" para filtrar por alumno
-
-{ "action": "ask", "message": "pregunta corta" }
-  → SOLO cuando sea imposible inferir la intención. Pregunta SOLO el dato mínimo que falta.
-  → PROHIBIDO: frases genéricas como "¿qué deseas hacer?" o "¿qué información necesitas?"
-
-## PRINCIPIOS DE INFERENCIA
-1. NUNCA preguntes lo que puedes asumir con defaults razonables
-2. Si el mensaje es solo un nombre → check_payment de ese alumno
-3. Si mencionan dinero + nombre → register_payment
-4. Si preguntan por fechas/vencimientos/cuándo → list_upcoming
-5. Si preguntan por clases/horarios/agenda → list_classes
-6. Si preguntan por deudas/morosos/quién debe → list_pending
-7. Palabras ambiguas como "todo", "todos", "resumen" → usa list_pending + asume contexto de pagos
-8. Typos y errores de escritura son normales, infiere la intención
-9. Omite campos opcionales si no se mencionan, usa defaults`            },
-            { role: 'user', content: texto }
-        ]
-    });
-
-    const raw = response.choices[0].message.content.trim();
-    return JSON.parse(raw);
-}
-
-/**
- * Llama a la API PHP de Dalsegno (api/bot.php en Hostinger)
- */
-async function llamarDalsegno(comando) {
-    if (!DALSEGNO_API_URL) throw new Error('DALSEGNO_API_URL no configurada');
-
-    const res = await fetch(DALSEGNO_API_URL, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Bot-Token': BOT_SECRET_TOKEN
-        },
-        body: JSON.stringify(comando)
-    });
-
-    if (!res.ok) {
-        const txt = await res.text().catch(() => '');
-        throw new Error(`Dalsegno API error ${res.status}: ${txt.slice(0, 100)}`);
-    }
-    return res.json();
-}
-
-// ── Manejador de mensajes entrantes ──────────────────────────────────────────
+// ── Manejador de mensajes ─────────────────────────────────────────────────────
 client.on('message', async (msg) => {
-    const body  = msg.body ? msg.body.trim() : '';
-    const lower = body.toLowerCase();
+    const isAudio = msg.type === 'audio' || msg.type === 'ptt';
+    const isText  = msg.type === 'chat';
+    if (!isAudio && !isText) return;
+    if (msg.from.includes('@g.us')) return; // ignorar grupos
 
-    // DEBUG: log todos los mensajes entrantes para ver el formato exacto del número
-    console.log(`[MSG] from="${msg.from}" body="${body.substring(0, 50)}" type="${msg.type}"`);
-
-    // ── Respuesta automática simple (para todos) ──────────────────────────
-    if (lower === 'hola' || lower === 'hello') {
-        msg.reply('¡Hola! Soy el asistente de Dalsegno 🎵. Para consultas sobre tus clases contacta a tu maestro.');
-        return;
-    }
-
-    // ── Comandos de IA (solo para números administradores autorizados) ────
-    if (ADMIN_PHONES.length === 0 || !openai || !DALSEGNO_API_URL) return;
-
-    // Ignorar grupos
-    if (msg.from.includes('@g.us')) return;
-
-    // Obtener número real del contacto (maneja tanto @c.us como @lid)
-    let numero = msg.from.replace('@c.us', '').replace('@s.whatsapp.net', '');
-    
-    // Si viene en formato @lid, obtener el número real del contacto
+    // Obtener número real
+    let numero = msg.from.replace(/@c\.us|@s\.whatsapp\.net/, '');
     if (msg.from.includes('@lid') || !/^\d+$/.test(numero)) {
-        try {
-            const contact = await msg.getContact();
-            numero = contact.number || contact.id.user;
-            console.log(`[MSG] Número real del contacto: "${numero}"`);
-        } catch (e) {
-            console.log(`[MSG] No se pudo obtener contacto: ${e.message}`);
-        }
+        try { const c = await msg.getContact(); numero = c.number || c.id.user; }
+        catch(e) { return; }
     }
 
-    // Solo admins autorizados
+    console.log(`[MSG] from="${numero}" type="${msg.type}" body="${(msg.body||'').substring(0,50)}"`);
+
     if (!ADMIN_PHONES.includes(numero)) {
-        console.log(`[MSG] ⛔ Número no autorizado: "${numero}" — Admins: [${ADMIN_PHONES.join(', ')}]`);
+        console.log(`[MSG] ⛔ No autorizado: ${numero}`);
         return;
     }
-    
-    console.log(`[MSG] ✅ Admin autorizado: ${numero}`);
+    console.log(`[MSG] ✅ Admin: ${numero}`);
 
-    // Ignorar mensajes muy cortos (menos de 4 chars)
-    if (!body || body.length < 4) return;
+    let texto = '';
 
-    console.log(`[BOT-IA] Mensaje de admin ${numero}: "${body.substring(0, 60)}"`);
-
-    // ── Comandos directos (sin IA, más rápidos) ───────────────────────────
-    if (lower === 'pendientes' || lower === 'sin pagar' || lower === 'quién debe') {
+    // ── Audio: transcribir ────────────────────────────────────────────────────
+    if (isAudio) {
+        if (!OPENAI_API_KEY) { await msg.reply('⚠️ Audio no disponible: falta OPENAI_API_KEY'); return; }
+        let proc;
+        try { proc = await msg.reply('🎙️ _Transcribiendo audio..._'); } catch(_) {}
         try {
-            const result = await llamarDalsegno({ action: 'list_pending' });
-            await msg.reply(result.message || 'Sin datos');
-        } catch (e) {
-            console.error('[BOT-IA] Error list_pending:', e.message);
-            await msg.reply('❌ Error al consultar pendientes: ' + e.message);
+            const media = await msg.downloadMedia();
+            const buf   = Buffer.from(media.data, 'base64');
+            texto = await transcribirAudio(buf, media.mimetype);
+            console.log(`[AUDIO] "${texto.substring(0, 100)}"`);
+            if (proc) { try { await proc.delete(true); } catch(_) {} }
+            await msg.reply(`🎙️ _"${texto}"_`);
+        } catch(e) {
+            if (proc) { try { await proc.delete(true); } catch(_) {} }
+            await msg.reply('❌ Error transcribiendo audio: ' + e.message);
+            return;
         }
-        return;
+    } else {
+        texto = msg.body.trim();
     }
 
-    if (lower === 'próximos' || lower === 'proximos' || lower === 'vencimientos' || lower === 'próximos pagos' || lower === 'proximos pagos') {
-        try {
-            const result = await llamarDalsegno({ action: 'list_upcoming', days: 30 });
-            await msg.reply(result.message || 'Sin datos');
-        } catch (e) {
-            console.error('[BOT-IA] Error list_upcoming:', e.message);
-            await msg.reply('❌ Error al consultar próximos vencimientos: ' + e.message);
-        }
-        return;
-    }
+    if (!texto || texto.length < 2) return;
 
-    if (lower === 'ayuda' || lower === 'help') {
-        await msg.reply(
-`🎵 *Comandos disponibles:*
+    // ── Interpretar y ejecutar ────────────────────────────────────────────────
+    let proc2;
+    try { proc2 = await msg.reply('⏳ _Procesando..._'); } catch(_) {}
 
-💰 *Registrar pago:*
-_"Santiago ya pagó 500 de guitarra"_
-_"Registra pago María 600 piano transferencia"_
-
-🔍 *Consultar pagos:*
-_"¿Ha pagado Roberto?"_
-_"Ver pagos de Ana González"_
-
-📋 *Sin pagar este mes:*
-_"pendientes"_ o _"quién debe"_
-
-📅 *Próximos vencimientos:*
-_"próximos pagos"_ o _"cuándo vencen los pagos"_
-
-🗓️ Puedes especificar el mes:
-_"Registra pago Juan 400 batería enero"_`
-        );
-        return;
-    }
-
-    // ── Interpretar con Claude ────────────────────────────────────────────
-    let procesando;
-    try {
-        procesando = await msg.reply('⏳ _Procesando..._');
-    } catch (_) { /* no es crítico */ }
+    const deleteProc = async () => { if (proc2) { try { await proc2.delete(true); } catch(_) {} } };
 
     try {
-        const comando = await interpretarComando(body);
-        console.log(`[BOT-IA] Comando interpretado:`, JSON.stringify(comando));
-
-        if (comando.action === 'ask') {
-            await msg.reply(`🤔 ${comando.message}`);
+        if (!OPENAI_API_KEY) {
+            await deleteProc();
+            await msg.reply('⚠️ Bot sin OPENAI_API_KEY. No puedo procesar comandos.');
             return;
         }
 
-        // Ejecutar en Dalsegno
-        const result = await llamarDalsegno(comando);
-        await msg.reply(result.message || (result.success ? '✅ Listo' : '❌ Error desconocido'));
+        const cmd = await interpretarMensaje(texto);
+        console.log(`[BOT] Comando:`, JSON.stringify(cmd));
+        await deleteProc();
 
-    } catch (e) {
-        console.error('[BOT-IA] Error:', e.message);
+        if (cmd.action === 'menu') {
+            await msg.reply(MENU_TEXT);
+            return;
+        }
 
+        if (cmd.action === 'none') {
+            await msg.reply(cmd.reply || '¡Hola! Escribe *menú* para ver opciones.');
+            return;
+        }
+
+        if (cmd.action === 'ask') {
+            await msg.reply(`🤔 ${cmd.message}`);
+            return;
+        }
+
+        // Todas las demás acciones van a bot.php
+        const result = await llamarDalsegno(cmd);
+        await msg.reply(result.message || (result.success ? '✅ Listo' : '❌ ' + (result.error || 'Error')));
+
+    } catch(e) {
+        await deleteProc();
+        console.error('[BOT] Error:', e.message);
         if (e.message.includes('JSON')) {
-            await msg.reply('❓ No entendí bien. Intenta ser más específico.\nEjemplo: _"Santiago pagó 500 de guitarra"_\nEscribe *ayuda* para ver todos los comandos.');
+            await msg.reply('❓ No entendí. Intenta de otra forma o escribe *menú*.');
         } else {
-            await msg.reply('❌ Error: ' + e.message);
+            await msg.reply('❌ ' + e.message);
         }
     }
 });
 
-// ── Rutas Express ─────────────────────────────────────────────────────────────
+// ── Express ───────────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
 
 app.get('/', (req, res) => {
-    const isReady = clientReady;
-    const iaStatus = openai && DALSEGNO_API_URL
-        ? `<div class="stat"><div class="stat-val" style="color:var(--green)">✓</div><div class="stat-key">IA activa</div></div>`
-        : `<div class="stat"><div class="stat-val" style="color:var(--amber)">—</div><div class="stat-key">IA no configurada</div></div>`;
-
-    const html = `<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Dalsegno — Bot WhatsApp</title>
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --green:   #22c55e; --green2: #16a34a; --amber: #f59e0b; --red: #ef4444;
-    --bg: #080d14; --surface: #0f1923; --surface2: #162130;
-    --border: rgba(255,255,255,.07); --text: #e8f0fe; --muted: #64748b;
-  }
-  body { font-family:'Sora',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:2rem 1rem; position:relative; overflow-x:hidden; }
-  body::before { content:''; position:fixed; inset:0; background:radial-gradient(ellipse 70% 50% at 20% 20%,rgba(34,197,94,.08) 0%,transparent 60%),radial-gradient(ellipse 50% 40% at 80% 80%,rgba(59,130,246,.07) 0%,transparent 60%); pointer-events:none; z-index:0; }
-  .card { position:relative; z-index:1; background:var(--surface); border:1px solid var(--border); border-radius:24px; padding:3rem 2.5rem; width:100%; max-width:480px; box-shadow:0 40px 80px rgba(0,0,0,.5); animation:slideUp .6s cubic-bezier(.16,1,.3,1) both; }
-  @keyframes slideUp { from{opacity:0;transform:translateY(30px)} to{opacity:1;transform:translateY(0)} }
-  .logo { display:flex; align-items:center; gap:.75rem; margin-bottom:2.5rem; }
-  .logo-icon { width:44px; height:44px; background:linear-gradient(135deg,#22c55e,#16a34a); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:1.4rem; box-shadow:0 0 20px rgba(34,197,94,.4); }
-  .logo-text { font-size:1.4rem; font-weight:800; letter-spacing:-.02em; }
-  .logo-sub { font-size:.7rem; color:var(--muted); font-weight:400; letter-spacing:.08em; text-transform:uppercase; margin-top:1px; }
-  .status-badge { display:inline-flex; align-items:center; gap:.5rem; padding:.35rem .9rem; border-radius:999px; font-size:.78rem; font-weight:600; letter-spacing:.03em; margin-bottom:2rem; border:1px solid; }
-  .status-badge.ready   { background:rgba(34,197,94,.1);  color:var(--green); border-color:rgba(34,197,94,.25); }
-  .status-badge.waiting { background:rgba(245,158,11,.1); color:var(--amber); border-color:rgba(245,158,11,.25); }
-  .dot { width:7px; height:7px; border-radius:50%; background:currentColor; animation:pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.7)} }
-  h1 { font-size:1.9rem; font-weight:800; line-height:1.15; letter-spacing:-.03em; margin-bottom:.6rem; }
-  .subtitle { color:var(--muted); font-size:.9rem; line-height:1.6; margin-bottom:2rem; }
-  .divider { height:1px; background:var(--border); margin:2rem 0; }
-  .qr-box { background:var(--surface2); border:1px solid var(--border); border-radius:16px; padding:1.5rem; text-align:center; margin-bottom:1.5rem; }
-  .qr-box img { width:220px; height:220px; border-radius:12px; display:block; margin:0 auto 1rem; background:white; padding:8px; }
-  .qr-hint { font-size:.78rem; color:var(--muted); line-height:1.5; }
-  .form-label { font-size:.75rem; font-weight:600; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; margin-bottom:.6rem; display:block; }
-  .form-row { display:flex; gap:.5rem; flex-wrap:wrap; }
-  .input { flex:1; min-width:0; background:var(--surface2); border:1px solid var(--border); border-radius:10px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:.82rem; padding:.65rem .9rem; outline:none; transition:border-color .2s; }
-  .input:focus { border-color:rgba(34,197,94,.5); }
-  .input::placeholder { color:var(--muted); }
-  .btn { padding:.65rem 1.4rem; background:linear-gradient(135deg,var(--green),var(--green2)); color:#fff; border:none; border-radius:10px; font-family:'Sora',sans-serif; font-size:.85rem; font-weight:700; cursor:pointer; transition:opacity .2s,transform .15s; white-space:nowrap; }
-  .btn:hover{opacity:.9;transform:translateY(-1px)} .btn:active{transform:translateY(0)} .btn:disabled{opacity:.4;cursor:not-allowed}
-  .token-row { display:flex; gap:.5rem; margin-bottom:1rem; }
-  #toast { position:fixed; bottom:2rem; left:50%; transform:translateX(-50%) translateY(20px); background:var(--surface2); border:1px solid var(--border); border-radius:12px; padding:.75rem 1.5rem; font-size:.85rem; font-weight:600; opacity:0; transition:all .3s; z-index:99; pointer-events:none; white-space:nowrap; }
-  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)} #toast.ok{color:var(--green);border-color:rgba(34,197,94,.3)} #toast.err{color:var(--red);border-color:rgba(239,68,68,.3)}
-  .stats { display:grid; grid-template-columns:1fr 1fr; gap:.75rem; margin-bottom:2rem; }
-  .stat { background:var(--surface2); border:1px solid var(--border); border-radius:12px; padding:.9rem 1rem; }
-  .stat-val { font-size:1.3rem; font-weight:800; letter-spacing:-.03em; }
-  .stat-key { font-size:.7rem; color:var(--muted); font-weight:500; letter-spacing:.05em; text-transform:uppercase; margin-top:2px; }
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="logo">
-    <div class="logo-icon">🎵</div>
-    <div><div class="logo-text">Dalsegno</div><div class="logo-sub">Bot WhatsApp + IA</div></div>
-  </div>
-  ${isReady ? `
-  <span class="status-badge ready"><span class="dot"></span>READY — Conectado</span>
-  <h1>Bot activo<br/>y en línea</h1>
-  <p class="subtitle">El servidor está procesando recordatorios y comandos de voz/texto con IA.</p>
-  <div class="stats">
-    <div class="stat"><div class="stat-val" style="color:var(--green)">✓</div><div class="stat-key">WhatsApp</div></div>
-    ${iaStatus}
-  </div>
-  <div class="divider"></div>
-  <label class="form-label">🔑 Token de acceso</label>
-  <div class="token-row"><input id="tokenInput" class="input" type="password" placeholder="Tu ADMIN_TOKEN"/></div>
-  <label class="form-label">📤 Enviar mensaje de prueba</label>
-  <div class="form-row" style="margin-bottom:.6rem"><input id="phoneInput" class="input" placeholder="521234567890"/></div>
-  <div class="form-row"><input id="textInput" class="input" placeholder="Escribe un mensaje de prueba..."/><button class="btn" onclick="sendTest()">Enviar</button></div>
-  ` : `
-  <span class="status-badge waiting"><span class="dot"></span>${clientState}</span>
-  <h1>Escanea el<br/>código QR</h1>
-  <p class="subtitle">Abre WhatsApp en tu celular → <strong>Dispositivos vinculados</strong> → <strong>Vincular dispositivo</strong> → escanea este código.</p>
-  <div class="qr-box">
-    ${qrDataUrl
-      ? `<img src="${qrDataUrl}" alt="QR"/>`
-      : `<div style="width:220px;height:220px;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;color:var(--muted);font-size:.85rem;background:var(--surface2);border-radius:12px">Generando QR…</div>`
+    if (global.__QR__) {
+        res.send(`<!DOCTYPE html><html><head><title>Dalsegno QR</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script></head>
+<body style="background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh">
+<h2>📱 Escanea con WhatsApp</h2><div id="qr"></div>
+<p style="opacity:.6;margin-top:16px">WhatsApp → ⋮ → Dispositivos vinculados → Vincular dispositivo</p>
+<script>new QRCode(document.getElementById('qr'),{text:"${global.__QR__}",width:300,height:300})</script>
+</body></html>`);
+    } else {
+        res.send(`<html><body style="background:#111;color:#0f0;font-family:monospace;padding:40px"><h2>✅ WhatsApp conectado y activo</h2></body></html>`);
     }
-    <p class="qr-hint">El QR se actualiza cada 20 segundos.<br/>Esta página recarga automáticamente.</p>
-  </div>
-  <script>setTimeout(()=>location.reload(),6000)</script>
-  `}
-</div>
-<div id="toast"></div>
-<script>
-async function sendTest() {
-  const phone=document.getElementById('phoneInput').value.trim();
-  const text=document.getElementById('textInput').value.trim();
-  const token=document.getElementById('tokenInput')?.value.trim()||'';
-  if(!phone||!text){showToast('Completa teléfono y mensaje',false);return;}
-  const btn=document.querySelector('.btn');
-  btn.disabled=true;btn.textContent='Enviando…';
-  try {
-    const url='/send?phone='+encodeURIComponent(phone)+'&text='+encodeURIComponent(text)+(token?'&token='+encodeURIComponent(token):'');
-    const r=await fetch(url); const j=await r.json();
-    if(j.ok){showToast('✅ Mensaje enviado!',true);}else{showToast('❌ '+(j.error||'Error'),false);}
-  }catch(e){showToast('❌ '+e.message,false);}
-  finally{btn.disabled=false;btn.textContent='Enviar';}
-}
-function showToast(msg,ok){
-  const t=document.getElementById('toast');
-  t.textContent=msg;t.className='show '+(ok?'ok':'err');
-  setTimeout(()=>t.className='',3500);
-}
-</script>
-</body>
-</html>`;
-    res.send(html);
 });
 
-app.get('/qr', (req, res) => {
-    if (clientReady) return res.json({ ok: true, message: 'Ya conectado, no necesitas QR' });
-    if (!qrDataUrl)  return res.status(202).json({ ok: false, message: 'QR aún no disponible, espera unos segundos' });
-    const base64 = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-    res.writeHead(200, { 'Content-Type': 'image/png' });
-    res.end(Buffer.from(base64, 'base64'));
-});
+app.get('/status', (req, res) => res.json({ ok: true, connected: !global.__QR__, admins: ADMIN_PHONES.length, ts: new Date().toISOString() }));
 
-app.get('/status', (req, res) => {
-    res.json({
-        ok: true,
-        ready: clientReady,
-        state: clientState,
-        ia: !!(openai && DALSEGNO_API_URL),
-        admins: ADMIN_PHONES.length
-    });
-});
-
-app.get('/send', authMiddleware, async (req, res) => {
-    const phone = normalizePhone(req.query.phone);
-    const text  = req.query.text || '';
-    if (!phone || phone.length < 10) return res.status(400).json({ ok: false, error: 'Teléfono inválido' });
-    if (!text.trim()) return res.status(400).json({ ok: false, error: 'El texto no puede estar vacío' });
+app.post('/send', async (req, res) => {
+    const token = req.headers['x-admin-token'] || '';
+    if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(401).json({ ok: false, error: 'No autorizado' });
+    const { phone, text } = req.body;
+    if (!phone || !text) return res.status(400).json({ ok: false, error: 'Faltan phone o text' });
     try {
-        const result = await sendMessage(phone, text);
-        console.log(`[SEND] ✅ ${phone} — "${text.substring(0, 40)}..."`);
-        res.json({ ok: true, phone, ...result });
-    } catch (err) {
-        console.error(`[SEND] ❌ ${phone} — ${err.message}`);
-        res.status(500).json({ ok: false, error: err.message });
-    }
+        await client.sendMessage(phone.includes('@') ? phone : phone + '@c.us', text);
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-app.post('/send', authMiddleware, async (req, res) => {
-    const phone = normalizePhone(req.body.phone || req.body.to);
-    const text  = req.body.text || req.body.message || '';
-    if (!phone || phone.length < 10) return res.status(400).json({ ok: false, error: 'Teléfono inválido' });
-    if (!text.trim()) return res.status(400).json({ ok: false, error: 'El texto no puede estar vacío' });
-    try {
-        const result = await sendMessage(phone, text);
-        console.log(`[SEND] ✅ ${phone} — "${text.substring(0, 40)}..."`);
-        res.json({ ok: true, phone, ...result });
-    } catch (err) {
-        console.error(`[SEND] ❌ ${phone} — ${err.message}`);
-        res.status(500).json({ ok: false, error: err.message });
-    }
-});
-
-// ── LIMPIEZA DE LOCKS DE CHROMIUM ────────────────────────────────────────────
+// ── Limpieza Chromium ─────────────────────────────────────────────────────────
 function cleanChromiumLocks() {
     const { execSync } = require('child_process');
-    console.log('[WA-CLEAN] ▶️  Iniciando limpieza de locks en:', SESSION_DIR);
-    
-    // 1. Eliminar todos los Singleton* donde sea que estén dentro de SESSION_DIR
-    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
-    lockFiles.forEach(lock => {
-        try {
-            execSync(`find "${SESSION_DIR}" -name "${lock}" -delete 2>/dev/null || true`);
-            console.log(`[WA-CLEAN] 🧹 Eliminado: ${lock}`);
-        } catch(e) { /* ignorar */ }
+    console.log('[WA-CLEAN] ▶️  Limpiando locks en:', SESSION_DIR);
+    ['SingletonLock','SingletonCookie','SingletonSocket'].forEach(lock => {
+        try { execSync(`find "${SESSION_DIR}" -name "${lock}" -delete 2>/dev/null || true`); console.log(`[WA-CLEAN] 🧹 ${lock}`); }
+        catch(e) {}
     });
-
-    // 2. Eliminar el archivo de lock principal de Chrome si existe
-    const chromeLock = path.join(SESSION_DIR, '.wwebjs_auth', 'session-default', 'Default', 'SingletonLock');
-    if (fs.existsSync(chromeLock)) {
-        try { fs.unlinkSync(chromeLock); console.log('[WA-CLEAN] 🧹 Lock principal eliminado'); }
-        catch(e) { console.warn('[WA-CLEAN] No se pudo eliminar lock principal:', e.message); }
-    }
-
-    // 3. Matar cualquier proceso Chromium/Chrome zombie
-    try {
-        execSync('pkill -f chromium 2>/dev/null || true');
-        execSync('pkill -f chrome 2>/dev/null || true');
-        console.log('[WA-CLEAN] 🧹 Procesos Chromium terminados');
-    } catch(e) { /* ignorar si no hay procesos */ }
-
+    try { execSync('pkill -f chromium 2>/dev/null || true'); execSync('pkill -f chrome 2>/dev/null || true'); } catch(e) {}
     console.log('[WA-CLEAN] ✅ Limpieza completada');
 }
 
 // ── Inicio ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-    console.log(`[SERVER] 🚀 Servidor escuchando en puerto ${PORT}`);
-    console.log(`[SERVER] Abre http://localhost:${PORT} en tu navegador para ver el QR`);
-    if (ADMIN_TOKEN)    console.log('[SERVER] 🔒 ADMIN_TOKEN configurado');
-    if (openai)         console.log('[SERVER] 🤖 OpenAI GPT activado');
-    if (ADMIN_PHONES.length > 0) console.log(`[SERVER] 📱 Admins autorizados: ${ADMIN_PHONES.join(', ')}`);
-    if (!openai)        console.log('[SERVER] ⚠️  Sin OPENAI_API_KEY — comandos IA desactivados');
-    if (!DALSEGNO_API_URL) console.log('[SERVER] ⚠️  Sin DALSEGNO_API_URL — conexión con Dalsegno desactivada');
+    console.log(`[SERVER] 🚀 Puerto ${PORT}`);
+    if (ADMIN_TOKEN)             console.log('[SERVER] 🔒 ADMIN_TOKEN ok');
+    if (OPENAI_API_KEY)          console.log('[SERVER] 🤖 OpenAI activado (GPT + Whisper)');
+    if (ADMIN_PHONES.length > 0) console.log(`[SERVER] 📱 Admins: ${ADMIN_PHONES.join(', ')}`);
+    if (!DALSEGNO_API_URL)       console.log('[SERVER] ⚠️  Sin DALSEGNO_API_URL');
 });
 
-// Ejecutar limpieza ANTES de inicializar el cliente
 console.log('[WA] Preparando ambiente...');
 cleanChromiumLocks();
 
-// Esperar 2 segundos para asegurarse que los locks están liberados
 setTimeout(() => {
     console.log('[WA] 🚀 Iniciando cliente WhatsApp...');
-    client.initialize().catch((err) => {
-        console.error('[WA] ❌ Error al inicializar cliente:', err.message);
-        // Intentar limpiar y reiniciar una vez más antes de morir
-        console.log('[WA] 🔄 Intentando limpieza adicional y reintento...');
+    client.initialize().catch(err => {
+        console.error('[WA] ❌ Error al inicializar:', err.message);
         cleanChromiumLocks();
-        setTimeout(() => {
-            client.initialize().catch((err2) => {
-                console.error('[WA] ❌ Fallo definitivo:', err2.message);
-                process.exit(1);
-            });
-        }, 3000);
+        setTimeout(() => client.initialize().catch(err2 => { console.error('[WA] ❌ Fallo definitivo:', err2.message); process.exit(1); }), 3000);
     });
 }, 2000);

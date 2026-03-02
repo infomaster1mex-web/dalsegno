@@ -30,6 +30,8 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode  = require('qrcode');
 const express = require('express');
+const fs      = require('fs');
+const path    = require('path');
 const app     = express();
 
 // ── NUEVO: SDK de OpenAI ──────────────────────────────────────────────────────
@@ -492,6 +494,24 @@ app.listen(PORT, () => {
     if (!openai)        console.log('[SERVER] ⚠️  Sin OPENAI_API_KEY — comandos IA desactivados');
     if (!DALSEGNO_API_URL) console.log('[SERVER] ⚠️  Sin DALSEGNO_API_URL — conexión con Dalsegno desactivada');
 });
+
+// ── Limpiar lock de Chromium al arrancar (evita crash en redeploys) ───────────
+try {
+    const lockFiles = [
+        path.join(SESSION_DIR, 'SingletonLock'),
+        path.join(SESSION_DIR, 'SingletonCookie'),
+        path.join(SESSION_DIR, 'SingletonSocket'),
+    ];
+    lockFiles.forEach(f => { if (fs.existsSync(f)) { fs.unlinkSync(f); console.log('[WA] 🧹 Lock eliminado:', f); } });
+    // También buscar en subcarpetas del perfil de Chromium
+    const profilePath = path.join(SESSION_DIR, 'Default');
+    if (fs.existsSync(profilePath)) {
+        const deepLock = path.join(profilePath, 'SingletonLock');
+        if (fs.existsSync(deepLock)) { fs.unlinkSync(deepLock); console.log('[WA] 🧹 Deep lock eliminado'); }
+    }
+} catch (e) {
+    console.warn('[WA] No se pudo limpiar lock:', e.message);
+}
 
 client.initialize().catch((err) => {
     console.error('[WA] Error al inicializar cliente:', err.message);

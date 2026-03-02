@@ -1,7 +1,9 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
- *  DALSEGNO — Bot WhatsApp Completo v2
- *  - Mensajes de texto + Audio (transcripción Whisper)
+ *  DALSEGNO — Bot WhatsApp v3
+ *  - Mensajes de texto ✅
+ *  - Audio (transcripción Whisper) ✅
+ *  - Imágenes (visión GPT-4o-mini) ✅  ← NUEVO
  *  - CRUD completo: alumnos, clases, pagos, materias
  *  - Consultas libres con IA + SQL dinámico desde bot.php
  *  - Menú interactivo con opciones
@@ -35,10 +37,62 @@ const OPENAI_API_KEY   = process.env.OPENAI_API_KEY   || '';
 const SESSION_DIR      = process.env.SESSION_DIR      || './session';
 const PORT             = process.env.PORT             || 3000;
 
-// ── OpenAI: chat completion ───────────────────────────────────────────────────
+// ── OpenAI: chat completion (solo texto) ──────────────────────────────────────
 function openaiChat(messages, maxTokens = 500, temperature = 0) {
     return new Promise((resolve, reject) => {
         const body = JSON.stringify({ model: 'gpt-4o-mini', max_tokens: maxTokens, temperature, messages });
+        const req = https.request({
+            hostname: 'api.openai.com', path: '/v1/chat/completions', method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY, 'Content-Length': Buffer.byteLength(body) }
+        }, res => {
+            let data = '';
+            res.on('data', d => data += d);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)?.choices?.[0]?.message?.content?.trim() || ''); }
+                catch(e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        req.write(body); req.end();
+    });
+}
+
+// ── OpenAI: visión de imágenes (GPT-4o-mini Vision) ──────────────────────────
+// Analiza la imagen y extrae información relevante para el negocio
+function analizarImagen(base64Data, mimeType, caption) {
+    return new Promise((resolve, reject) => {
+        const imageUrl = `data:${mimeType || 'image/jpeg'};base64,${base64Data}`;
+
+        const userContent = [
+            {
+                type: 'image_url',
+                image_url: { url: imageUrl, detail: 'high' }
+            },
+            {
+                type: 'text',
+                text: `Eres el asistente de Dalsegno, escuela de música en México.
+El dueño te mandó esta imagen por WhatsApp${caption ? ` con el mensaje: "${caption}"` : ''}.
+
+Analiza la imagen y extrae TODA la información relevante para el negocio:
+- Si es un comprobante de pago/transferencia: nombre del alumno (si se ve), monto, fecha, banco/método
+- Si es una lista o nota con nombres y montos: extrae todos los registros
+- Si es un horario, calendario o agenda: extrae fechas, horas, alumnos
+- Si es una fotografía de documento con datos de alumno: nombre, teléfono, etc.
+- Cualquier dato útil para registrar en el sistema
+
+Responde en español con un resumen claro y natural de lo que ves, como si le hablaras al dueño.
+Ejemplo: "Veo un comprobante de transferencia de $500 a nombre de Ana García del 15 de marzo, banco BBVA."
+Si no hay información útil para el negocio, describe brevemente qué ves.`
+            }
+        ];
+
+        const body = JSON.stringify({
+            model: 'gpt-4o-mini',
+            max_tokens: 600,
+            temperature: 0,
+            messages: [{ role: 'user', content: userContent }]
+        });
+
         const req = https.request({
             hostname: 'api.openai.com', path: '/v1/chat/completions', method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY, 'Content-Length': Buffer.byteLength(body) }
@@ -141,6 +195,8 @@ ACCIONES DISPONIBLES:
 
 2. register_payment — Registrar pago de mensualidad
    { "action": "register_payment", "student_name": "", "amount": 0, "subject": "Música", "month": "${mes}", "method": "cash" }
+   → Si viene de imagen/comprobante y dice transferencia → method: "transfer"
+   → Si se ve tarjeta → method: "card"
 
 3. create_student — Nuevo alumno
    { "action": "create_student", "name": "", "phone": "", "email": "" }
@@ -178,7 +234,8 @@ REGLAS IMPORTANTES:
 - "hoy" = ${new Date().toISOString().slice(0,10)}
 - Para pagos sin método → asumir "cash"
 - Para clases sin duración → asumir 60 min
-- Para clases sin precio → asumir 0 (se actualizará después)` },
+- Para clases sin precio → asumir 0 (se actualizará después)
+- Si el texto viene de análisis de imagen y describe un comprobante de pago → usar register_payment` },
         { role: 'user', content: texto }
     ], 400, 0);
 
@@ -211,7 +268,13 @@ _"cuánto cobré este mes"_
 _"resumen de pagos de marzo"_
 _"clases pendientes de pago"_
 
-🎙️ *También puedes mandarme audios con tus instrucciones*`;
+🎙️ *AUDIO* — Mándame un audio con tu instrucción
+
+🖼️ *IMÁGENES* — Mándame una foto de:
+  • Comprobante de transferencia/pago
+  • Lista de alumnos o apuntes
+  • Horario o agenda manuscrita
+  El bot extrae la info y la registra automáticamente`;
 
 // ── WhatsApp Client ───────────────────────────────────────────────────────────
 const client = new Client({
@@ -234,9 +297,13 @@ client.on('disconnected',   r  => console.log('[WA] Desconectado:', r));
 
 // ── Manejador de mensajes ─────────────────────────────────────────────────────
 client.on('message', async (msg) => {
-    const isAudio = msg.type === 'audio' || msg.type === 'ptt';
-    const isText  = msg.type === 'chat';
-    if (!isAudio && !isText) return;
+    const isAudio  = msg.type === 'audio' || msg.type === 'ptt';
+    const isText   = msg.type === 'chat';
+    const isImage  = msg.type === 'image';
+    // sticker, document con imagen, etc. también pueden tener visión
+    const isDoc    = msg.type === 'document' && (msg.mimetype || '').startsWith('image/');
+
+    if (!isAudio && !isText && !isImage && !isDoc) return;
     if (msg.from.includes('@g.us')) return; // ignorar grupos
 
     // Obtener número real
@@ -246,7 +313,7 @@ client.on('message', async (msg) => {
         catch(e) { return; }
     }
 
-    console.log(`[MSG] from="${numero}" type="${msg.type}" body="${(msg.body||'').substring(0,50)}"`);
+    console.log(`[MSG] from="${numero}" type="${msg.type}" body="${(msg.body||'').substring(0,60)}"`);
 
     if (!ADMIN_PHONES.includes(numero)) {
         console.log(`[MSG] ⛔ No autorizado: ${numero}`);
@@ -254,11 +321,15 @@ client.on('message', async (msg) => {
     }
     console.log(`[MSG] ✅ Admin: ${numero}`);
 
+    if (!OPENAI_API_KEY) {
+        await msg.reply('⚠️ Bot sin OPENAI_API_KEY. No puedo procesar mensajes.');
+        return;
+    }
+
     let texto = '';
 
-    // ── Audio: transcribir ────────────────────────────────────────────────────
+    // ── Audio: transcribir con Whisper ────────────────────────────────────────
     if (isAudio) {
-        if (!OPENAI_API_KEY) { await msg.reply('⚠️ Audio no disponible: falta OPENAI_API_KEY'); return; }
         let proc;
         try { proc = await msg.reply('🎙️ _Transcribiendo audio..._'); } catch(_) {}
         try {
@@ -273,25 +344,54 @@ client.on('message', async (msg) => {
             await msg.reply('❌ Error transcribiendo audio: ' + e.message);
             return;
         }
-    } else {
+    }
+
+    // ── Imagen: analizar con GPT-4o-mini Vision ───────────────────────────────
+    else if (isImage || isDoc) {
+        const caption = (msg.body || '').trim(); // texto que acompaña a la imagen
+        let proc;
+        try { proc = await msg.reply('🖼️ _Analizando imagen..._'); } catch(_) {}
+        try {
+            const media = await msg.downloadMedia();
+            // Validar tamaño (máx ~4 MB en base64 ≈ 3 MB de imagen)
+            if (media.data && media.data.length > 5_500_000) {
+                if (proc) { try { await proc.delete(true); } catch(_) {} }
+                await msg.reply('⚠️ Imagen demasiado grande. Intenta con una foto más pequeña o comprimida.');
+                return;
+            }
+            const descripcion = await analizarImagen(media.data, media.mimetype, caption);
+            console.log(`[IMAGE] Descripción: "${descripcion.substring(0, 150)}"`);
+            if (proc) { try { await proc.delete(true); } catch(_) {} }
+
+            // Mostrar al admin qué vio el bot en la imagen
+            await msg.reply(`🖼️ *Lo que veo en la imagen:*\n${descripcion}`);
+
+            // Si hay descripción útil, intentar convertirla en acción
+            texto = caption
+                ? `${caption}. Información de la imagen: ${descripcion}`
+                : descripcion;
+
+        } catch(e) {
+            if (proc) { try { await proc.delete(true); } catch(_) {} }
+            await msg.reply('❌ Error analizando imagen: ' + e.message);
+            return;
+        }
+    }
+
+    // ── Texto plano ───────────────────────────────────────────────────────────
+    else {
         texto = msg.body.trim();
     }
 
     if (!texto || texto.length < 2) return;
 
-    // ── Interpretar y ejecutar ────────────────────────────────────────────────
+    // ── Interpretar texto/transcripción/descripción imagen y ejecutar ─────────
     let proc2;
     try { proc2 = await msg.reply('⏳ _Procesando..._'); } catch(_) {}
 
     const deleteProc = async () => { if (proc2) { try { await proc2.delete(true); } catch(_) {} } };
 
     try {
-        if (!OPENAI_API_KEY) {
-            await deleteProc();
-            await msg.reply('⚠️ Bot sin OPENAI_API_KEY. No puedo procesar comandos.');
-            return;
-        }
-
         const cmd = await interpretarMensaje(texto);
         console.log(`[BOT] Comando:`, JSON.stringify(cmd));
         await deleteProc();
@@ -373,7 +473,7 @@ function cleanChromiumLocks() {
 app.listen(PORT, () => {
     console.log(`[SERVER] 🚀 Puerto ${PORT}`);
     if (ADMIN_TOKEN)             console.log('[SERVER] 🔒 ADMIN_TOKEN ok');
-    if (OPENAI_API_KEY)          console.log('[SERVER] 🤖 OpenAI activado (GPT + Whisper)');
+    if (OPENAI_API_KEY)          console.log('[SERVER] 🤖 OpenAI activado (GPT-4o-mini Vision + Whisper)');
     if (ADMIN_PHONES.length > 0) console.log(`[SERVER] 📱 Admins: ${ADMIN_PHONES.join(', ')}`);
     if (!DALSEGNO_API_URL)       console.log('[SERVER] ⚠️  Sin DALSEGNO_API_URL');
 });

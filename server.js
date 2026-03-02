@@ -232,6 +232,9 @@ client.on('message', async (msg) => {
     const body  = msg.body ? msg.body.trim() : '';
     const lower = body.toLowerCase();
 
+    // DEBUG: log todos los mensajes entrantes para ver el formato exacto del número
+    console.log(`[MSG] from="${msg.from}" body="${body.substring(0, 50)}" type="${msg.type}"`);
+
     // ── Respuesta automática simple (para todos) ──────────────────────────
     if (lower === 'hola' || lower === 'hello') {
         msg.reply('¡Hola! Soy el asistente de Dalsegno 🎵. Para consultas sobre tus clases contacta a tu maestro.');
@@ -248,7 +251,10 @@ client.on('message', async (msg) => {
     if (msg.from.includes('@g.us')) return;
 
     // Solo admins autorizados
-    if (!ADMIN_PHONES.includes(numero)) return;
+    if (!ADMIN_PHONES.includes(numero)) {
+        console.log(`[MSG] ⛔ Número no autorizado: "${numero}" — Admins: [${ADMIN_PHONES.join(', ')}]`);
+        return;
+    }
 
     // Ignorar mensajes muy cortos (menos de 4 chars)
     if (!body || body.length < 4) return;

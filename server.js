@@ -17,7 +17,7 @@
  *   SESSION_DIR     Carpeta donde guardar la sesión   (por defecto: ./session)
  *
  *  ── NUEVAS VARIABLES PARA IA ──────────────────────────
- *   ANTHROPIC_API_KEY   Tu API key de Anthropic (claude)
+ *   OPENAI_API_KEY      Tu API key de OpenAI (sk-...)
  *   DALSEGNO_API_URL    URL completa del bot.php en Hostinger
  *                       ej: https://tudominio.com/api/bot.php
  *   BOT_SECRET_TOKEN    Token secreto compartido con api/bot.php en PHP
@@ -32,8 +32,8 @@ const qrcode  = require('qrcode');
 const express = require('express');
 const app     = express();
 
-// ── NUEVO: SDK de Anthropic ───────────────────────────────────────────────────
-const Anthropic = require('@anthropic-ai/sdk');
+// ── NUEVO: SDK de OpenAI ──────────────────────────────────────────────────────
+const OpenAI = require('openai');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -44,13 +44,12 @@ const ADMIN_TOKEN  = process.env.ADMIN_TOKEN  || '';
 const SESSION_DIR  = process.env.SESSION_DIR  || './session';
 
 // ── NUEVO: Configuración de IA y Dalsegno ────────────────────────────────────
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const DALSEGNO_API_URL  = process.env.DALSEGNO_API_URL  || '';   // https://tudominio.com/api/bot.php
-const BOT_SECRET_TOKEN  = process.env.BOT_SECRET_TOKEN  || '';   // mismo token que en api/bot.php
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY    || '';
+const DALSEGNO_API_URL  = process.env.DALSEGNO_API_URL  || '';
+const BOT_SECRET_TOKEN  = process.env.BOT_SECRET_TOKEN  || '';
 const ADMIN_PHONES      = (process.env.ADMIN_PHONES || '').split(',').map(p => p.trim()).filter(Boolean);
-// Si no configuras ADMIN_PHONES, los comandos IA quedan desactivados
 
-const claude = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 // ── Estado global ─────────────────────────────────────────────────────────────
 let qrDataUrl   = null;
@@ -144,22 +143,27 @@ async function sendMessage(phone, text) {
 // ── NUEVO: Funciones de IA ────────────────────────────────────────────────────
 
 /**
- * Usa Claude para interpretar un comando en lenguaje natural
+ * Usa GPT para interpretar un comando en lenguaje natural
  * y convertirlo a una acción estructurada JSON.
  */
 async function interpretarComando(texto) {
-    if (!claude) throw new Error('ANTHROPIC_API_KEY no configurada');
+    if (!openai) throw new Error('OPENAI_API_KEY no configurada');
 
     const mesActual = new Date().toISOString().slice(0, 7); // "2026-03"
     const fechaHoy  = new Date().toLocaleDateString('es-MX', {
         weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
     });
 
-    const response = await claude.messages.create({
-        model: 'claude-sonnet-4-20250514',
+    const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',   // barato y muy rápido, perfecto para esto
         max_tokens: 300,
-        system: `Eres el asistente de Dalsegno, escuela de música en México.
-Tu trabajo es interpretar comandos en español natural y responder SOLO con JSON válido sin ningún texto adicional, sin markdown, sin comillas de código.
+        temperature: 0,         // respuestas consistentes
+        response_format: { type: 'json_object' }, // fuerza JSON puro, sin markdown
+        messages: [
+            {
+                role: 'system',
+                content: `Eres el asistente de Dalsegno, escuela de música en México.
+Tu trabajo es interpretar comandos en español natural y responder SOLO con JSON válido.
 
 Fecha actual: ${fechaHoy}
 Mes actual (YYYY-MM): ${mesActual}
@@ -184,19 +188,19 @@ Reglas:
 - Infiere el instrumento del contexto (ej: "clase de piano" → subject: "Piano")
 - Nombres propios: capitaliza la primera letra
 
-Ejemplos de entrada → salida:
+Ejemplos:
 "Santiago ya pagó 500 de guitarra" → {"action":"register_payment","student_name":"Santiago","amount":500,"subject":"Guitarra","month":"${mesActual}","method":"cash"}
-"registra pago de María González 600 piano por transferencia" → {"action":"register_payment","student_name":"María González","amount":600,"subject":"Piano","month":"${mesActual}","method":"transfer"}
-"¿ha pagado Roberto este mes?" → {"action":"check_payment","student_name":"Roberto"}
+"registra pago de María 600 piano transferencia" → {"action":"register_payment","student_name":"María","amount":600,"subject":"Piano","month":"${mesActual}","method":"transfer"}
+"¿ha pagado Roberto?" → {"action":"check_payment","student_name":"Roberto"}
 "quién debe" → {"action":"list_pending"}
-"pagó 400" → {"action":"ask","message":"¿Quién pagó y por qué clase?"}`,
-        messages: [{ role: 'user', content: texto }]
+"pagó 400" → {"action":"ask","message":"¿Quién pagó y por qué clase?"}`
+            },
+            { role: 'user', content: texto }
+        ]
     });
 
-    const raw = response.content[0].text.trim();
-    // Limpiar posibles bloques de código si el modelo los incluyó
-    const clean = raw.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
+    const raw = response.choices[0].message.content.trim();
+    return JSON.parse(raw);
 }
 
 /**
@@ -233,7 +237,7 @@ client.on('message', async (msg) => {
     }
 
     // ── Comandos de IA (solo para números administradores autorizados) ────
-    if (ADMIN_PHONES.length === 0 || !claude || !DALSEGNO_API_URL) return;
+    if (ADMIN_PHONES.length === 0 || !openai || !DALSEGNO_API_URL) return;
 
     // Obtener número del remitente (quitar @c.us)
     const numero = msg.from.replace('@c.us', '').replace('@s.whatsapp.net', '');
@@ -316,7 +320,7 @@ _"Registra pago Juan 400 batería enero"_`
 
 app.get('/', (req, res) => {
     const isReady = clientReady;
-    const iaStatus = claude && DALSEGNO_API_URL
+    const iaStatus = openai && DALSEGNO_API_URL
         ? `<div class="stat"><div class="stat-val" style="color:var(--green)">✓</div><div class="stat-key">IA activa</div></div>`
         : `<div class="stat"><div class="stat-val" style="color:var(--amber)">—</div><div class="stat-key">IA no configurada</div></div>`;
 
@@ -443,7 +447,7 @@ app.get('/status', (req, res) => {
         ok: true,
         ready: clientReady,
         state: clientState,
-        ia: !!(claude && DALSEGNO_API_URL),
+        ia: !!(openai && DALSEGNO_API_URL),
         admins: ADMIN_PHONES.length
     });
 });
@@ -483,9 +487,9 @@ app.listen(PORT, () => {
     console.log(`[SERVER] 🚀 Servidor escuchando en puerto ${PORT}`);
     console.log(`[SERVER] Abre http://localhost:${PORT} en tu navegador para ver el QR`);
     if (ADMIN_TOKEN)    console.log('[SERVER] 🔒 ADMIN_TOKEN configurado');
-    if (claude)         console.log('[SERVER] 🤖 Claude IA activado');
+    if (openai)         console.log('[SERVER] 🤖 OpenAI GPT activado');
     if (ADMIN_PHONES.length > 0) console.log(`[SERVER] 📱 Admins autorizados: ${ADMIN_PHONES.join(', ')}`);
-    if (!claude)        console.log('[SERVER] ⚠️  Sin ANTHROPIC_API_KEY — comandos IA desactivados');
+    if (!openai)        console.log('[SERVER] ⚠️  Sin OPENAI_API_KEY — comandos IA desactivados');
     if (!DALSEGNO_API_URL) console.log('[SERVER] ⚠️  Sin DALSEGNO_API_URL — conexión con Dalsegno desactivada');
 });
 

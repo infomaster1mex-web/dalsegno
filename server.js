@@ -530,61 +530,35 @@ app.post('/send', authMiddleware, async (req, res) => {
     }
 });
 
-// ── LIMPIEZA PROFUNDA DE LOCKS (SOLUCIÓN RAILWAY) ────────────────────────────
+// ── LIMPIEZA DE LOCKS DE CHROMIUM ────────────────────────────────────────────
 function cleanChromiumLocks() {
-    try {
-        // Patrón de archivos/carpetas a eliminar
-        const lockPatterns = [
-            'SingletonLock', 
-            'SingletonCookie', 
-            'SingletonSocket',
-            'Network Persistent State', 
-            '.com.google.Chrome.metadata_shm',
-            'GPUCache', 
-            'Code Cache', 
-            'Service Worker',
-            'Cache',
-            'shader_cache',
-            '.chrome_profile_lock',
-        ];
-        
-        function cleanDir(dir) {
-            if (!fs.existsSync(dir)) return;
-            try {
-                const files = fs.readdirSync(dir);
-                files.forEach(file => {
-                    const full = path.join(dir, file);
-                    try {
-                        const stat = fs.statSync(full);
-                        const shouldDelete = lockPatterns.some(p => file.includes(p));
-                        
-                        if (shouldDelete) {
-                            if (stat.isDirectory()) {
-                                fs.rmSync(full, { recursive: true, force: true });
-                                console.log('[WA-CLEAN] 🧹 Eliminado carpeta:', file);
-                            } else {
-                                fs.unlinkSync(full);
-                                console.log('[WA-CLEAN] 🧹 Eliminado archivo:', file);
-                            }
-                        } else if (stat.isDirectory() && !['node_modules', '.cache'].includes(file)) {
-                            // Recursivamente limpiar subdirectorios
-                            cleanDir(full);
-                        }
-                    } catch (e) {
-                        console.warn('[WA-CLEAN] Error procesando:', file, e.message);
-                    }
-                });
-            } catch (e) {
-                console.warn('[WA-CLEAN] Error leyendo directorio:', dir, e.message);
-            }
-        }
-        
-        console.log('[WA-CLEAN] ▶️  Iniciando limpieza de locks...');
-        cleanDir(SESSION_DIR);
-        console.log('[WA-CLEAN] ✅ Limpieza completada');
-    } catch (e) {
-        console.error('[WA-CLEAN] Error crítico:', e.message);
+    const { execSync } = require('child_process');
+    console.log('[WA-CLEAN] ▶️  Iniciando limpieza de locks en:', SESSION_DIR);
+    
+    // 1. Eliminar todos los Singleton* donde sea que estén dentro de SESSION_DIR
+    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+    lockFiles.forEach(lock => {
+        try {
+            execSync(`find "${SESSION_DIR}" -name "${lock}" -delete 2>/dev/null || true`);
+            console.log(`[WA-CLEAN] 🧹 Eliminado: ${lock}`);
+        } catch(e) { /* ignorar */ }
+    });
+
+    // 2. Eliminar el archivo de lock principal de Chrome si existe
+    const chromeLock = path.join(SESSION_DIR, '.wwebjs_auth', 'session-default', 'Default', 'SingletonLock');
+    if (fs.existsSync(chromeLock)) {
+        try { fs.unlinkSync(chromeLock); console.log('[WA-CLEAN] 🧹 Lock principal eliminado'); }
+        catch(e) { console.warn('[WA-CLEAN] No se pudo eliminar lock principal:', e.message); }
     }
+
+    // 3. Matar cualquier proceso Chromium/Chrome zombie
+    try {
+        execSync('pkill -f chromium 2>/dev/null || true');
+        execSync('pkill -f chrome 2>/dev/null || true');
+        console.log('[WA-CLEAN] 🧹 Procesos Chromium terminados');
+    } catch(e) { /* ignorar si no hay procesos */ }
+
+    console.log('[WA-CLEAN] ✅ Limpieza completada');
 }
 
 // ── Inicio ────────────────────────────────────────────────────────────────────
@@ -602,10 +576,19 @@ app.listen(PORT, () => {
 console.log('[WA] Preparando ambiente...');
 cleanChromiumLocks();
 
-// Esperar un poco para que se complete la limpieza
+// Esperar 2 segundos para asegurarse que los locks están liberados
 setTimeout(() => {
+    console.log('[WA] 🚀 Iniciando cliente WhatsApp...');
     client.initialize().catch((err) => {
         console.error('[WA] ❌ Error al inicializar cliente:', err.message);
-        process.exit(1);
+        // Intentar limpiar y reiniciar una vez más antes de morir
+        console.log('[WA] 🔄 Intentando limpieza adicional y reintento...');
+        cleanChromiumLocks();
+        setTimeout(() => {
+            client.initialize().catch((err2) => {
+                console.error('[WA] ❌ Fallo definitivo:', err2.message);
+                process.exit(1);
+            });
+        }, 3000);
     });
-}, 1000);
+}, 2000);

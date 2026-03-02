@@ -1,9 +1,9 @@
 /**
  * DALSEGNO — Bot WhatsApp v4
  * - Memoria de conversación (sesiones)
- * - Sin mensajes temporales que se borran
- * - Flujos guiados paso a paso
+ * - Sin mensajes temporales
  * - Texto + Audio (Whisper) + Imágenes (GPT-4o Vision)
+ * - CRUD completo: alumnos, profesores, clases, pagos
  */
 'use strict';
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -45,8 +45,7 @@ function openaiChat(messages, maxTokens = 500, temperature = 0) {
             res.on('data', d => data += d);
             res.on('end', () => { try { resolve(JSON.parse(data)?.choices?.[0]?.message?.content?.trim() || ''); } catch(e) { reject(e); } });
         });
-        req.on('error', reject);
-        req.write(body); req.end();
+        req.on('error', reject); req.write(body); req.end();
     });
 }
 
@@ -57,9 +56,7 @@ function analizarImagen(base64Data, mimeType, caption) {
             model: 'gpt-4o-mini', max_tokens: 600, temperature: 0,
             messages: [{ role: 'user', content: [
                 { type: 'image_url', image_url: { url: `data:${mimeType||'image/jpeg'};base64,${base64Data}`, detail: 'high' } },
-                { type: 'text', text: `Eres asistente de Dalsegno, escuela de música en México.${caption ? ` El dueño adjuntó: "${caption}".` : ''}
-Extrae info útil: comprobantes de pago (nombre, monto, fecha, banco), listas de alumnos, horarios, datos de contacto.
-Responde en español natural. Sé específico con números y nombres.` }
+                { type: 'text', text: `Eres asistente de Dalsegno, escuela de música en México.${caption?` El dueño escribió: "${caption}".`:''} Extrae info útil para el negocio: comprobantes (nombre, monto, fecha, banco), listas de alumnos, horarios, datos de contacto. Responde en español natural y específico.` }
             ]}]
         });
         const req = https.request({
@@ -70,8 +67,7 @@ Responde en español natural. Sé específico con números y nombres.` }
             res.on('data', d => data += d);
             res.on('end', () => { try { resolve(JSON.parse(data)?.choices?.[0]?.message?.content?.trim() || ''); } catch(e) { reject(e); } });
         });
-        req.on('error', reject);
-        req.write(body); req.end();
+        req.on('error', reject); req.write(body); req.end();
     });
 }
 
@@ -82,17 +78,16 @@ function transcribirAudio(audioBuffer, mimeType) {
         fs.writeFileSync(tmpFile, audioBuffer);
         const form = new FormData();
         form.append('file', fs.createReadStream(tmpFile), { filename: 'audio.ogg', contentType: mimeType || 'audio/ogg' });
-        form.append('model', 'whisper-1');
-        form.append('language', 'es');
+        form.append('model', 'whisper-1'); form.append('language', 'es');
         const req = https.request({
             hostname: 'api.openai.com', path: '/v1/audio/transcriptions', method: 'POST',
             headers: { ...form.getHeaders(), 'Authorization': 'Bearer ' + OPENAI_API_KEY }
         }, res => {
             let data = '';
             res.on('data', d => data += d);
-            res.on('end', () => { fs.unlink(tmpFile, () => {}); try { resolve(JSON.parse(data)?.text || ''); } catch(e) { reject(e); } });
+            res.on('end', () => { fs.unlink(tmpFile, ()=>{}); try { resolve(JSON.parse(data)?.text || ''); } catch(e) { reject(e); } });
         });
-        req.on('error', err => { fs.unlink(tmpFile, () => {}); reject(err); });
+        req.on('error', err => { fs.unlink(tmpFile, ()=>{}); reject(err); });
         form.pipe(req);
     });
 }
@@ -115,8 +110,7 @@ function llamarDalsegno(comando) {
                 try { resolve(JSON.parse(data)); } catch(e) { reject(new Error('Respuesta inválida')); }
             });
         });
-        req.on('error', reject);
-        req.write(body); req.end();
+        req.on('error', reject); req.write(body); req.end();
     });
 }
 
@@ -135,76 +129,118 @@ async function interpretarMensaje(texto, sesion) {
     const hoyISO = new Date().toISOString().slice(0,10);
 
     const mensajeUsuario = sesion
-        ? `[CONTEXTO SESION: accion="${sesion.action}" datos_ya_recogidos=${JSON.stringify(sesion.data)}]\nRespuesta del usuario: "${texto}"`
+        ? `[CONTEXTO SESION: accion_pendiente="${sesion.action}" datos_ya_recopilados=${JSON.stringify(sesion.data)}]\nRespuesta del usuario ahora: "${texto}"`
         : texto;
 
     const raw = await openaiChat([
-        { role: 'system', content: `Eres asistente de Dalsegno, escuela de música en México.
-El dueño gestiona su negocio desde WhatsApp. SOLO responde JSON válido, sin markdown ni backticks.
+        { role: 'system', content: `Eres el asistente de Dalsegno, escuela de música en México.
+El dueño administra su negocio por WhatsApp. SOLO responde JSON válido, sin markdown ni backticks.
 
-Hoy: ${hoy} | Mes actual: ${mes} | hoyISO: ${hoyISO} | mañanaISO: ${manana}
+Hoy: ${hoy} | Mes: ${mes} | hoyISO: ${hoyISO} | mañanaISO: ${manana}
 
 ESQUEMA BD:
 ${DB_SCHEMA}
 
-ACCIONES:
-1. query:          { "action":"query", "question":"..." }
-2. register_payment: { "action":"register_payment", "student_name":"", "amount":0, "subject":"Música", "month":"${mes}", "method":"cash" }
-3. create_student:  { "action":"create_student", "name":"", "phone":"", "email":"" }
-4. create_class:    { "action":"create_class", "student_name":"", "subject":"", "date":"YYYY-MM-DD", "time":"HH:MM", "duration":60, "price":0, "type":"presencial" }
-5. update_student:  { "action":"update_student", "student_name":"", "field":"phone|email|status|name", "value":"" }
-6. update_class:    { "action":"update_class", "class_id":0, "field":"status|payment_status|date|time|notes|price", "value":"" }
-7. delete_record:   { "action":"delete_record", "type":"student|class|payment", "id":0 }
-8. menu:            { "action":"menu" }
-9. none:            { "action":"none", "reply":"..." }
-10. ask (solo si falta dato IMPRESCINDIBLE):
-    { "action":"ask", "message":"pregunta breve", "pending_action":"create_student", "partial_data":{"name":"Juan"} }
+ACCIONES DISPONIBLES:
 
-REGLAS:
-- Si hay CONTEXTO SESION: combina datos acumulados + respuesta actual y ejecuta si ya tienes todo
-- Crear alumno: SOLO nombre obligatorio (phone/email opcionales, dejar vacío si no se dan)
-- Registrar pago: nombre + monto obligatorios. method default "cash"
-- Crear clase: alumno + materia + fecha + hora obligatorios. duration=60, price=0 por default
-- Consultas -> siempre "query"
-- NO preguntes datos opcionales
-- Comprobante en imagen -> register_payment con method="transfer"` },
+── CONSULTAS ─────────────────────────────────────────────────────
+query:            { "action":"query", "question":"..." }
+
+── PAGOS ─────────────────────────────────────────────────────────
+register_payment: { "action":"register_payment", "student_name":"", "amount":0, "subject":"Música", "month":"${mes}", "method":"cash|transfer|card" }
+
+── ALUMNOS ───────────────────────────────────────────────────────
+create_student:   { "action":"create_student", "name":"", "phone":"", "email":"" }
+update_student:   { "action":"update_student", "student_name":"", "field":"phone|email|status|name", "value":"" }
+delete_by_name:   { "action":"delete_by_name", "name":"", "user_type":"student" }
+
+── PROFESORES ────────────────────────────────────────────────────
+create_teacher:   { "action":"create_teacher", "name":"", "phone":"", "email":"", "subject":"" }
+update_teacher:   { "action":"update_teacher", "teacher_name":"", "field":"phone|email|status|name", "value":"" }
+delete_by_name:   { "action":"delete_by_name", "name":"", "user_type":"teacher" }
+
+── CLASES ────────────────────────────────────────────────────────
+create_class:     { "action":"create_class", "student_name":"", "subject":"", "date":"YYYY-MM-DD", "time":"HH:MM", "duration":60, "price":0, "type":"presencial|online", "notes":"" }
+update_class:     { "action":"update_class", "class_id":0, "field":"status|payment_status|date|time|notes|price|subject|duration|type", "value":"" }
+delete_record:    { "action":"delete_record", "type":"class|payment", "id":0 }
+
+── SISTEMA ───────────────────────────────────────────────────────
+menu:             { "action":"menu" }
+none:             { "action":"none", "reply":"..." }
+ask:              { "action":"ask", "message":"pregunta corta", "pending_action":"create_student", "partial_data":{} }
+
+REGLAS CRÍTICAS:
+1. Si hay CONTEXTO SESION → combina datos_ya_recopilados + respuesta actual → ejecuta si tienes todo
+2. Para BORRAR POR NOMBRE (alumno/profe) → SIEMPRE usa delete_by_name, NUNCA delete_record con id=0
+3. Para REACTIVAR → usar update_student/update_teacher con field="status" value="active"
+4. Datos obligatorios mínimos:
+   - create_student: solo name (phone/email opcionales, dejar vacío "")
+   - create_teacher: solo name (phone/email/subject opcionales)
+   - register_payment: student_name + amount
+   - create_class: student_name + subject + date + time
+5. "mañana"=${manana} | "hoy"=${hoyISO} | sin método de pago→"cash" | sin duración→60 | sin precio→0
+6. Infiere nombres con typos (noe v → Noe V, noé vázquez, etc.)
+7. Para consultas SIEMPRE "query"
+8. "dar de baja", "desactivar", "borrar" → delete_by_name con status o delete_by_name
+9. "reactivar", "activar de nuevo" → update_student/teacher field="status" value="active"
+10. Comprobante en imagen → register_payment con method="transfer"` },
         { role: 'user', content: mensajeUsuario }
     ], 500, 0);
 
     return JSON.parse(raw);
 }
 
-const MENU_TEXT = `🎵 *Dalsegno Bot v4*
+// ── Menú completo ─────────────────────────────────────────────────────────────
+const MENU_TEXT = `🎵 *Dalsegno Bot — Todo lo que puedo hacer*
 
-💰 *PAGOS*
+━━━━━━━━━━━━━━━━━━━━━━
+💰 *REGISTRAR PAGOS*
 • _"Ana pagó 500 de guitarra"_
-• _"registrar pago de cristian 800"_
-• _"quién debe este mes"_
-• _"historial pagos de Ana"_
+• _"registrar pago cristian 800 transferencia"_
+• _"pago de Juan 600 con tarjeta"_
 
+━━━━━━━━━━━━━━━━━━━━━━
 👥 *ALUMNOS*
 • _"agregar nuevo alumno"_
-• _"lista de alumnos"_
-• _"cambiar teléfono de Ana a 496-000-0000"_
-• _"dar de baja a Roberto"_
+• _"nuevo alumno Juan García 4961234567"_
+• _"cambiar teléfono de Ana a 4961234567"_
+• _"cambiar email de Roberto"_
+• _"dar de baja a Noe V"_ / _"borrar alumno X"_
+• _"reactivar alumno Juan"_
 
+━━━━━━━━━━━━━━━━━━━━━━
+👨‍🏫 *PROFESORES*
+• _"agregar profesor Miguel, guitarra"_
+• _"cambiar teléfono del profe Miguel"_
+• _"dar de baja al profe Noe"_
+
+━━━━━━━━━━━━━━━━━━━━━━
 📅 *CLASES*
-• _"programar clase"_
-• _"clases de esta semana"_
+• _"programar clase piano con Ana mañana 4pm"_
+• _"clase guitarra con Juan el viernes 5pm"_
 • _"cancelar clase #45"_
-• _"marcar pagada clase #50"_
-
-📊 *REPORTES*
-• _"cuánto cobré este mes"_
-• _"alumnos sin pago este mes"_
-• _"clases pendientes de pago"_
-
-🗑️ *ELIMINAR*
+• _"marcar como pagada clase #50"_
+• _"cambiar fecha de clase #32 al lunes"_
+• _"agregar nota a clase #28: trajo su guitarra"_
 • _"eliminar clase #23"_
-• _"eliminar pago #10"_
 
-🎙️ *Audios* — habla directo
-🖼️ *Fotos* — comprobantes, listas, horarios`;
+━━━━━━━━━━━━━━━━━━━━━━
+📊 *CONSULTAS Y REPORTES*
+• _"lista de alumnos activos"_
+• _"lista de profesores"_
+• _"clases de esta semana"_
+• _"clases de hoy"_
+• _"quién debe este mes"_
+• _"historial de pagos de Ana"_
+• _"cuánto cobré este mes"_
+• _"clases pendientes de pago"_
+• _"resumen de marzo"_
+• _"pagos de Ana en febrero"_
+
+━━━━━━━━━━━━━━━━━━━━━━
+🎙️ *Audios* — habla directo, te entiendo
+🖼️ *Fotos* — comprobantes, listas, horarios
+   (registro automático desde imagen)`;
 
 // ── WhatsApp Client ───────────────────────────────────────────────────────────
 const client = new Client({
@@ -212,10 +248,10 @@ const client = new Client({
     puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process'] }
 });
 
-client.on('qr',           qr => { console.log('[WA] QR listo'); global.__QR__ = qr; });
+client.on('qr',           qr => { console.log('[WA] QR listo — visita http://localhost:'+PORT); global.__QR__=qr; });
 client.on('authenticated',() => console.log('[WA] Autenticado'));
 client.on('auth_failure', m  => console.error('[WA] Auth failure:', m));
-client.on('ready',        () => { console.log('[WA] Listo'); global.__QR__ = null; });
+client.on('ready',        () => { console.log('[WA] Listo y conectado'); global.__QR__=null; });
 client.on('disconnected', r  => console.log('[WA] Desconectado:', r));
 
 client.on('message', async (msg) => {
@@ -234,8 +270,7 @@ client.on('message', async (msg) => {
 
     console.log(`[MSG] from="${numero}" type="${msg.type}" body="${(msg.body||'').substring(0,60)}"`);
     if (!ADMIN_PHONES.includes(numero)) return;
-
-    if (!OPENAI_API_KEY) { await msg.reply('Sin OPENAI_API_KEY'); return; }
+    if (!OPENAI_API_KEY) { await msg.reply('⚠️ Sin OPENAI_API_KEY'); return; }
 
     let texto = '';
 
@@ -255,7 +290,7 @@ client.on('message', async (msg) => {
             const desc = await analizarImagen(media.data, media.mimetype, caption);
             console.log(`[IMAGE] "${desc.substring(0,150)}"`);
             await msg.reply(`🖼️ *Veo:* ${desc}`);
-            texto = caption ? `${caption}. Imagen: ${desc}` : desc;
+            texto = caption ? `${caption}. Imagen muestra: ${desc}` : desc;
         } catch(e) { await msg.reply('❌ Error en imagen: ' + e.message); return; }
     }
     else {
@@ -274,7 +309,7 @@ client.on('message', async (msg) => {
         if (cmd.action !== 'ask') clearConvSession(numero);
 
         if (cmd.action === 'menu') { await msg.reply(MENU_TEXT); return; }
-        if (cmd.action === 'none') { await msg.reply(cmd.reply || 'Escribe *menú* para ver opciones.'); return; }
+        if (cmd.action === 'none') { await msg.reply(cmd.reply || '¡Hola! Escribe *menú* para ver todo lo que puedo hacer.'); return; }
 
         if (cmd.action === 'ask') {
             const pa = cmd.pending_action || sesion?.action || 'unknown';
@@ -286,11 +321,11 @@ client.on('message', async (msg) => {
         }
 
         const result = await llamarDalsegno(cmd);
-        await msg.reply(result.message || (result.success ? '✅ Listo' : '❌ ' + (result.error || 'Error')));
+        await msg.reply(result.message || (result.success ? '✅ Listo' : '❌ ' + (result.error || 'Error desconocido')));
 
     } catch(e) {
         console.error('[BOT] Error:', e.message);
-        await msg.reply(e.message.includes('JSON') ? '❓ No entendí. Escribe *menú*.' : '❌ ' + e.message);
+        await msg.reply(e.message.includes('JSON') ? '❓ No entendí bien. Intenta de nuevo o escribe *menú*.' : '❌ ' + e.message);
     }
 });
 
@@ -303,11 +338,11 @@ app.get('/', (req, res) => {
         res.send(`<!DOCTYPE html><html><head><title>Dalsegno QR</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script></head>
 <body style="background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh">
-<h2>Escanea con WhatsApp</h2><div id="qr"></div>
-<p style="opacity:.6">WhatsApp -> Dispositivos vinculados -> Vincular dispositivo</p>
+<h2>📱 Escanea con WhatsApp</h2><div id="qr"></div>
+<p style="opacity:.6">WhatsApp → ⋮ → Dispositivos vinculados → Vincular dispositivo</p>
 <script>new QRCode(document.getElementById('qr'),{text:"${global.__QR__}",width:300,height:300})</script></body></html>`);
     } else {
-        res.send(`<html><body style="background:#111;color:#0f0;font-family:monospace;padding:40px"><h2>WhatsApp conectado</h2><p>Sesiones: ${convSessions.size}</p></body></html>`);
+        res.send(`<html><body style="background:#111;color:#0f0;font-family:monospace;padding:40px"><h2>✅ WhatsApp conectado</h2><p>Sesiones activas: ${convSessions.size}</p></body></html>`);
     }
 });
 
@@ -332,7 +367,7 @@ function cleanChromiumLocks() {
 
 app.listen(PORT, () => {
     console.log(`[SERVER] Puerto ${PORT}`);
-    if (OPENAI_API_KEY)          console.log('[SERVER] OpenAI activado (Vision + Whisper)');
+    if (OPENAI_API_KEY)          console.log('[SERVER] OpenAI activo (Vision + Whisper)');
     if (ADMIN_PHONES.length > 0) console.log(`[SERVER] Admins: ${ADMIN_PHONES.join(', ')}`);
     if (!DALSEGNO_API_URL)       console.log('[SERVER] ADVERTENCIA: Sin DALSEGNO_API_URL');
 });

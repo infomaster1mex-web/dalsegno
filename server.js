@@ -246,11 +246,10 @@ LAST_ENTITY activo: ${ctx.lastEntity ? JSON.stringify(ctx.lastEntity) : 'ninguno
         return safeParseJSON(raw);
     } catch(e) {
         console.log(`[BOT] JSON inválido, reintentando... raw="${raw.substring(0,150)}"`);
-        // Reintentar una vez pidiendo explícitamente JSON limpio
+        // Reintentar una vez con el mensaje original, sin el response fallido
         const raw2 = await openaiChat([
             ...messages,
-            { role:'assistant', content: raw },
-            { role:'user', content: 'Responde SOLO el JSON válido sin backticks ni texto extra.' }
+            { role:'user', content: 'ERROR: Tu respuesta anterior no fue JSON válido. Analiza de nuevo el mensaje del usuario y responde ÚNICAMENTE con el objeto JSON de la acción. Sin texto, sin backticks, sin explicaciones. Solo el JSON.' }
         ], 600, 0);
         return safeParseJSON(raw2);
     }

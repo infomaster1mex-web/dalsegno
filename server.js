@@ -234,7 +234,9 @@ ACCIONES:
     usuario: "pero agregale este numero 4961587988" → update_student marybel phone=4961587988
     usuario: "y con correo marybel@gmail.com" → update_student marybel email=marybel@gmail.com ✅ (NO "none")
 
-LAST_ENTITY activo: ${ctx.lastEntity ? JSON.stringify(ctx.lastEntity) : 'ninguno'}` },
+LAST_ENTITY activo: ${ctx.lastEntity ? JSON.stringify(ctx.lastEntity) : 'ninguno'}
+
+15. IDs REALES: Las listas muestran IDs reales como (#ID). Cuando el usuario dice "borrame el 4" o "elimina el #8", BUSCA en el historial de esta conversación el ID real (#N) del registro. Si la lista decía "4. *Cristian* (#8)", y el usuario dice "borrame el 4", el ID real es 8 NO 4. Siempre usa el número entre paréntesis (#). Si no hay ID claro en el historial, primero haz un query para encontrar el ID.` },
         ...ctx.history,
         { role:'user', content: textoActual }
     ];

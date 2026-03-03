@@ -201,16 +201,21 @@ ACCIONES:
 ════════ REGLAS DE CONTEXTO (MUY IMPORTANTES) ════════
 1. PRONOMBRES: "la","lo","el alumno","ella","él" → ÚLTIMA persona del historial
 2. Si historial muestra que se creó/mencionó a "Mariana" y dice "ponle el tel..." → update_student Mariana
-3. Si dice "registrala/registralo con tel X" después de crear alumno → update_student del último alumno con field=phone
-4. Si dice "cancelar" una clase (no pago) → update_class status=cancelled (NO delete_record)
-5. Si dice "cancelar el pago" → update tiene que cambiar payment status
-6. "dar de baja"/"desactivar" → update_student status=inactive
-7. "reactivar"/"dar de alta" → update_student status=active
-8. Si bot.php devolvió "Varios alumnos: X, Y ¿Cuál?" Y el usuario responde con nombre o número → pasar el nombre correcto al campo student_name de la acción pendiente
-9. NUNCA inventar emails
-10. Comprobante en imagen → register_payment con method="transfer"
-11. "profesor"/"maestro"/"teacher" → create_teacher (NO create_student)
-12. Mes actual: "este mes"="${mes}"
+3. Si dice "registrala/registralo con tel X" → update_student del LAST_ENTITY con field=phone
+4. "y con correo X", "también su email X", "y su correo X", "ponle el correo X" → update_student LAST_ENTITY field=email
+5. "y su tel X", "también ponle el tel X", "y con número X" → update_student LAST_ENTITY field=phone
+6. Cualquier mensaje que empiece con "y " o "también " con LAST_ENTITY activo → continuar editando ese registro
+7. Si dice "cancelar" una clase → update_class status=cancelled (NO delete_record)
+8. "dar de baja"/"desactivar" → update_student status=inactive | "reactivar" → status=active
+9. Si bot.php devolvió "Varios alumnos: X, Y" → esperar selección del usuario
+10. NUNCA inventar emails. NUNCA responder "none" cuando hay un LAST_ENTITY y el mensaje da un dato como correo o teléfono
+11. Comprobante en imagen → register_payment con method="transfer"
+12. "profesor"/"maestro"/"teacher" → create_teacher (NO create_student)
+13. Mes actual: "este mes"="${mes}"
+14. REGLA CRÍTICA DE ENCADENAMIENTO:
+    usuario: "nuevo alumno marybel" → crea alumno → LAST_ENTITY={name:marybel}
+    usuario: "pero agregale este numero 4961587988" → update_student marybel phone=4961587988
+    usuario: "y con correo marybel@gmail.com" → update_student marybel email=marybel@gmail.com ✅ (NO "none")
 
 LAST_ENTITY activo: ${ctx.lastEntity ? JSON.stringify(ctx.lastEntity) : 'ninguno'}` },
         ...ctx.history,

@@ -38,6 +38,20 @@ function saveCtx(n, history, lastEntity, pendingSelection = null) {
     convContexts.set(n, { history: history.slice(-MAX_HISTORY), lastEntity, pendingSelection, ts: Date.now() });
 }
 
+// ── Safe JSON parser (limpia backticks, texto extra, etc.) ────────────────────
+function safeParseJSON(raw) {
+    if (!raw || typeof raw !== 'string') throw new Error('Respuesta vacía');
+    // 1) Quitar backticks de markdown
+    let clean = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+    // 2) Si hay texto antes del {, extraer solo el JSON
+    const firstBrace = clean.indexOf('{');
+    const lastBrace  = clean.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        clean = clean.substring(firstBrace, lastBrace + 1);
+    }
+    return JSON.parse(clean);
+}
+
 // ── OpenAI helpers ────────────────────────────────────────────────────────────
 function openaiChat(messages, maxTokens = 600, temperature = 0) {
     return new Promise((resolve, reject) => {
@@ -107,7 +121,10 @@ function llamarDalsegno(comando) {
             let data=''; res.on('data',d=>data+=d);
             res.on('end',()=>{
                 if (res.statusCode!==200) return reject(new Error(`API error ${res.statusCode}: ${data.slice(0,200)}`));
-                try{resolve(JSON.parse(data));}catch(e){reject(new Error('Respuesta inválida'));}
+                try{resolve(JSON.parse(data));}catch(e){
+                    // Si bot.php devuelve texto plano en vez de JSON, envolverlo
+                    resolve({success:false, message: data.slice(0,500) || 'Respuesta inválida del servidor'});
+                }
             });
         });
         req.on('error',reject); req.write(body); req.end();
@@ -223,7 +240,18 @@ LAST_ENTITY activo: ${ctx.lastEntity ? JSON.stringify(ctx.lastEntity) : 'ninguno
     ];
 
     const raw = await openaiChat(messages, 600, 0);
-    return JSON.parse(raw);
+    try {
+        return safeParseJSON(raw);
+    } catch(e) {
+        console.log(`[BOT] JSON inválido, reintentando... raw="${raw.substring(0,150)}"`);
+        // Reintentar una vez pidiendo explícitamente JSON limpio
+        const raw2 = await openaiChat([
+            ...messages,
+            { role:'assistant', content: raw },
+            { role:'user', content: 'Responde SOLO el JSON válido sin backticks ni texto extra.' }
+        ], 600, 0);
+        return safeParseJSON(raw2);
+    }
 }
 
 const MENU_TEXT = `🎵 *Dalsegno Bot v6*
@@ -398,7 +426,11 @@ client.on('message', async (msg) => {
         console.error('[BOT] Error:', e.message);
         const newHistory = [...ctx.history, { role:'user', content: textoHist }];
         saveCtx(numero, newHistory, ctx.lastEntity, null);
-        await msg.reply(e.message.includes('JSON')?'❓ No entendí. Escribe *menú*.':'❌ '+e.message);
+        if (e.message.includes('JSON') || e.message.includes('vacía')) {
+            await msg.reply('❓ No entendí tu mensaje. Intenta escribirlo de otra forma o escribe *menú* para ver opciones.');
+        } else {
+            await msg.reply('❌ '+e.message);
+        }
     }
 });
 

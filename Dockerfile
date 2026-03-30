@@ -9,7 +9,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Decirle a Puppeteer que use el Chromium del sistema (no descargar uno propio)
+# Puppeteer >=24 usa PUPPETEER_SKIP_DOWNLOAD, versiones viejas usan PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
